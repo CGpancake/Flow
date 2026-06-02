@@ -1,0 +1,18 @@
+# Dependencies and package manager caches
+node_modules/
+.pi/npm/node_modules/
+
+# Project Flow runtime/local state
+.pi/project-flow/sessions/*
+!.pi/project-flow/sessions/.gitkeep
+.pi/project-flow/plans/*
+!.pi/project-flow/plans/.gitkeep
+.pi/project-flow/self-test/*
+!.pi/project-flow/self-test/.gitkeep
+.pi/project-flow/memory/*
+!.pi/project-flow/memory/.gitkeep
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.tmp
