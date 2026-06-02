@@ -2,6 +2,7 @@
 
 This directory contains the canonical Project Flow documentation.
 
+- `../INSTALLATION.md` — prerequisites, dependencies, setup, validation, and basic usage.
 - `spec.md` — product/runtime specification.
 - `architecture.md` — lifecycle ownership, module boundaries, and implementation shape.
 - `integrations.md` — boundaries for `pi-web-access`, `pi-subagents`, and future capability providers.

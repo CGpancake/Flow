@@ -30,6 +30,7 @@ Project Flow core is the only lifecycle owner. Modules, tools, subagents, and ex
 
 ## Documentation map
 
+- `INSTALLATION.md` — prerequisites, dependencies, setup, validation, and basic usage.
 - `docs/spec.md` — canonical product/runtime specification.
 - `docs/architecture.md` — architecture, module boundaries, and salvaged patterns.
 - `docs/protocols/codebase-reading.md` — shallow-first reading and memory protocol.
