@@ -12,6 +12,11 @@ node_modules/
 .pi/project-flow/memory/*
 !.pi/project-flow/memory/.gitkeep
 
+# Local machine config
+.env
+.env.*
+!.env.example
+
 # OS/editor noise
 .DS_Store
 Thumbs.db

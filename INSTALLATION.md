@@ -38,6 +38,41 @@ Tracked dependency files:
 
 `node_modules/` is intentionally ignored.
 
+## Link this clone as your global Project Flow extension
+
+For development, prefer a global symlink instead of hardcoding this clone's absolute path in `~/.pi/agent/settings.json`.
+
+1. Copy the local env template and edit the path:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+Set:
+
+```bash
+PI_PROJECT_FLOW_REPO="/absolute/path/to/Flow"
+```
+
+2. Create/update the global Pi extension symlink:
+
+```bash
+node scripts/link-global.mjs
+```
+
+This creates:
+
+```text
+~/.pi/agent/extensions/project-flow -> $PI_PROJECT_FLOW_REPO/.pi/extensions/project-flow
+```
+
+Pi auto-discovers global extensions from `~/.pi/agent/extensions/*/index.ts`, so the clone now loads globally without a machine-specific package path in settings. Restart Pi or run `/reload`.
+
+If you previously added the clone path to `~/.pi/agent/settings.json` under `packages`, remove that entry to avoid duplicate `project_flow_*` tools.
+
+`.env` is intentionally gitignored. Commit `.env.example`, not your local `.env`.
+
 ## Install Pi capability packages
 
 Project Flow uses two Pi packages as capability backends:
@@ -64,6 +99,9 @@ pi install npm:pi-subagents --local
 Project Flow no longer hardcodes local machine paths. Configure these only if needed:
 
 ```bash
+# Source project used by scripts/link-global.mjs
+export PI_PROJECT_FLOW_REPO="/path/to/Flow"
+
 # Source project used by /reload-flow when copying extension/support files into another project
 export PI_PROJECT_FLOW_DEV_ROOT="/path/to/Flow"
 

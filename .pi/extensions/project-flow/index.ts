@@ -3,6 +3,7 @@ import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, extname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Clean Project Flow base extension.
@@ -72,6 +73,7 @@ const READ_ONLY_TOOLS = [
   "grep",
   "find",
   "ls",
+  "subagent",
   "web_search",
   "code_search",
   "fetch_content",
@@ -98,6 +100,8 @@ const SLASH_SUBAGENT_STARTED_EVENT = "subagent:slash:started";
 const PF_WORKER_MODEL = process.env.PI_PROJECT_FLOW_WORKER_MODEL || process.env.PI_PROJECT_FLOW_CHEAP_MODEL || "";
 const PF_REVIEW_MODEL = process.env.PI_PROJECT_FLOW_REVIEW_MODEL || process.env.PI_PROJECT_FLOW_EXPENSIVE_MODEL || "";
 const MAX_SAFE_CARGO_JOBS = Number(process.env.PI_PROJECT_FLOW_MAX_CARGO_JOBS || "2");
+const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+const PACKAGE_FLOW_DIR = join(EXTENSION_DIR, "..", "..", "project-flow");
 
 let state: SessionState = {
   id: "none",
@@ -133,6 +137,9 @@ function ensureProjectFlow(cwd: string): void {
   for (const dir of [ROOT_DIR, MEMORY_DIR, PLANS_DIR, SESSIONS_DIR]) mkdirSync(join(cwd, dir), { recursive: true });
   const memoryIndex = join(cwd, MEMORY_DIR, "index.md");
   if (!existsSync(memoryIndex)) writeAtomic(memoryIndex, "# Project Flow Memory Index\n\n- Clean Project Flow memory.\n");
+  const welcomePath = join(cwd, WELCOME_ART_PATH);
+  const packageWelcomePath = join(PACKAGE_FLOW_DIR, "welcome-art.md");
+  if (!existsSync(welcomePath) && existsSync(packageWelcomePath)) copyTextFileAtomic(packageWelcomePath, welcomePath);
 }
 
 function writeAtomic(path: string, body: string): void {
@@ -588,6 +595,8 @@ function projectFlowPlanningRules(): string {
     "- Inspect shallow-first with read-only tools.",
     "- Use project_flow_memory_search for long-term memory lookups instead of loading large memory/log files.",
     "- Use pi-web-access tools only if research materially improves the plan.",
+    "- Research gate: before using pi-web-access or launching researcher, identify the missing external fact, why repo inspection/project memory cannot answer it, and how the answer affects the plan. If no such fact exists, do not research.",
+    "- If the task is large, unfamiliar, or externally dependent, you may use the subagent tool for read-only planning support: scout for codebase reconnaissance and researcher for external/library/current-doc evidence. Keep this optional and targeted; do not spawn subagents for small obvious plans. When launching scout, explicitly require the Codebase Reading Protocol: project_flow_list_modules, project_flow_read_headers, project_flow_read_signatures, then selective full read only if needed. When launching researcher, include the research gate statement in the task and require a concise file-only or compact sourced answer.",
     "- Before the first grill question, sketch the potential plan privately and sweep it for all build-readiness blockers you can identify. Form a blocker queue, but ask only the first unresolved blocker.",
     "- Ask concise blocking questions through project_flow_grill_cycle when multiple current-cycle blockers are known, or project_flow_grill_question when only one blocker is known. Do not merge independent ambiguities into one question; queue them as separate question objects. Each grill question must include a single recommended answer, alternatives, a default assumption, and room for additional user context.",
     "- Grill loop requirement: precompute the current grill-cycle queue where possible so the UI can advance responsively from one concise question to the next. Keep related blockers adjacent before farther-apart topics. After the cycle is answered, plug collected answers back into the potential plan, revise blocker status, and re-sweep for blockers introduced or removed by the answers. If new blockers appear, start another grill cycle. Only then save the final plan.",
@@ -639,6 +648,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     "Build now in this session",
     "Compact handoff / build after compact",
     "Build in fresh subagent worker",
+    "Build with GSD subagent pipeline",
     "Stop process / no build",
   ]);
 
@@ -662,7 +672,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     saveState(ctx.cwd);
     renderWidget(ctx);
     setTools(pi, READ_ONLY_TOOLS);
-    pi.sendMessage({ customType: "project-flow-compact-handoff", content: `# Project Flow Compact Handoff\n\nPlan ready: ${rel(ctx.cwd, planPath)}\n\nRecommended next steps:\n\n1. Run /compact.\n2. Run /plan-continue.\n3. Approve Build now in this session or Build in fresh subagent worker.\n\nNo build has started.`, display: true }, { triggerTurn: false });
+    pi.sendMessage({ customType: "project-flow-compact-handoff", content: `# Project Flow Compact Handoff\n\nPlan ready: ${rel(ctx.cwd, planPath)}\n\nRecommended next steps:\n\n1. Run /compact.\n2. Run /plan-continue.\n3. Approve Build now in this session, Build in fresh subagent worker, or Build with GSD subagent pipeline.\n\nNo build has started.`, display: true }, { triggerTurn: false });
     ctx.ui.notify("Project Flow compact handoff prepared; no build started.", "info");
     return;
   }
@@ -675,7 +685,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
 
     const bridge = await requestSubagentBridge(pi, withModel({
       agent: "worker",
-      task: `[PROJECT FLOW: SUBAGENT BUILD]\nPlan file: ${rel(ctx.cwd, planPath)}\n\nRead the written plan and implement only plan-approved changes. Keep scope tight. Validate and return changed files, validation evidence, blockers, and follow-ups. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record. Use only tools/skills needed for this plan; do not inherit or assume parent-only context.`, 
+      task: `[PROJECT FLOW: SUBAGENT BUILD]\nPlan file: ${rel(ctx.cwd, planPath)}\n\nRead the written plan and implement only plan-approved changes. Keep scope tight. Validate and return changed files, validation evidence, blockers, and follow-ups. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record. Use only tools/skills needed for this plan; do not inherit or assume parent-only context.`, 
       reads: [rel(ctx.cwd, planPath)],
       skill: false,
       context: "fresh",
@@ -699,6 +709,109 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     const text = bridge.response?.result?.content?.find?.((c: any) => c.type === "text")?.text ?? "Subagent worker started.";
     ctx.ui.notify("Project Flow worker started via AgentAdapter.", "info");
     pi.sendMessage({ customType: "project-flow-agent-started", content: `# Project Flow Worker Started\n\n${text}`, display: true }, { triggerTurn: false });
+    return;
+  }
+
+  if (choice === "Build with GSD subagent pipeline") {
+    state.phase = "build_requested";
+    saveState(ctx.cwd);
+    renderWidget(ctx);
+    setTools(pi, ["read", "bash", "subagent", "project_flow_finish", "project_flow_context", "project_flow_list_modules", "project_flow_read_headers", "project_flow_read_signatures", "project_flow_memory_search"]);
+
+    const planRel = rel(ctx.cwd, planPath);
+    const bridge = await requestSubagentBridge(pi, {
+      context: "fresh",
+      async: true,
+      agentScope: "both",
+      chain: [
+        {
+          parallel: [
+            {
+              agent: "scout",
+              phase: "GSD planning",
+              label: "Codebase slice map",
+              as: "codeSlices",
+              task: `[PROJECT FLOW: GSD CODEBASE SLICES]\nPlan file: ${planRel}\n\nRead the plan and follow the Codebase Reading Protocol before deeper inspection: project_flow_list_modules, project_flow_read_headers for relevant files, project_flow_read_signatures, then selective full read only if needed. Inspect only the files needed to map implementation slices. Do not modify project/source files. Return clear GSD slices: slice name, owned files, dependencies/order, likely conflicts, and first file to open for each slice.`,
+              reads: [planRel],
+              output: "gsd/code-slices.md",
+              outputMode: "file-only",
+            },
+            {
+              agent: "reviewer",
+              phase: "GSD planning",
+              label: "Plan risk and scope check",
+              as: "riskPlan",
+              task: `[PROJECT FLOW: GSD RISK CHECK]\nPlan file: ${planRel}\n\nReview the saved plan for implementation risks before writing. Do not modify project/source files. Identify blockers, hidden decisions, scope creep risks, and smallest safe sequencing for a single writer worker.`,
+              reads: [planRel],
+              output: "gsd/risk-plan.md",
+              outputMode: "file-only",
+            },
+            {
+              agent: "reviewer",
+              phase: "GSD planning",
+              label: "Validation plan",
+              as: "validationPlan",
+              task: `[PROJECT FLOW: GSD VALIDATION PLAN]\nPlan file: ${planRel}\n\nReview the saved plan and produce focused validation/doc/memory checks. Do not modify project/source files. Include exact commands when possible. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved.`,
+              reads: [planRel],
+              output: "gsd/validation-plan.md",
+              outputMode: "file-only",
+            },
+          ],
+          concurrency: 3,
+        },
+        {
+          agent: "worker",
+          phase: "Implementation",
+          label: "Single writer implementation",
+          as: "workerResult",
+          task: `[PROJECT FLOW: GSD SINGLE WRITER BUILD]\nPlan file: ${planRel}\n\nImplement only plan-approved changes. You are the sole writer for the active worktree. Use the GSD slice/risk/validation summaries below to sequence work, but do not expand scope or make unapproved product/architecture decisions. If a blocker or unapproved decision is required, stop and report it. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Validate with focused checks. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.\n\nCode slices:\n{outputs.codeSlices}\n\nRisk plan:\n{outputs.riskPlan}\n\nValidation plan:\n{outputs.validationPlan}`,
+          reads: [planRel],
+          output: "gsd/worker-result.md",
+          outputMode: "file-only",
+          progress: true,
+        },
+        {
+          parallel: [
+            {
+              agent: "reviewer",
+              phase: "Validation",
+              label: "Implementation validation",
+              task: `Validate the post-worker diff against the saved plan ${planRel}. Start from worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report blockers, fixes worth doing now, and validation gaps.`,
+              reads: [planRel],
+              output: "gsd/implementation-validation.md",
+              outputMode: "file-only",
+            },
+            {
+              agent: "reviewer",
+              phase: "Validation",
+              label: "Scope and docs validation",
+              task: `Validate scope control, docs/memory needs, and regression risk after the worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report only evidence-backed issues with file references.`,
+              reads: [planRel],
+              output: "gsd/scope-docs-validation.md",
+              outputMode: "file-only",
+            },
+          ],
+          concurrency: 2,
+        },
+      ],
+    });
+
+    if (!bridge.ok) {
+      state.phase = "blocked";
+      state.notes = [...(state.notes ?? []), `AgentAdapter blocked GSD pipeline build: ${bridge.error}`];
+      saveState(ctx.cwd);
+      renderWidget(ctx);
+      ctx.ui.notify(`AgentAdapter blocked GSD build: ${bridge.error}`, "error");
+      pi.sendMessage({ customType: "project-flow-agent-blocked", content: agentFailureReport(ctx, planPath, bridge.error, bridge.requestId), display: true }, { triggerTurn: false });
+      return;
+    }
+
+    state.phase = "building";
+    saveState(ctx.cwd);
+    renderWidget(ctx);
+    const text = bridge.response?.result?.content?.find?.((c: any) => c.type === "text")?.text ?? "GSD subagent pipeline started.";
+    ctx.ui.notify("Project Flow GSD pipeline started via AgentAdapter.", "info");
+    pi.sendMessage({ customType: "project-flow-agent-started", content: `# Project Flow GSD Pipeline Started\n\n${text}`, display: true }, { triggerTurn: false });
   }
 }
 
