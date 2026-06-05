@@ -2,6 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, extname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -91,23 +92,46 @@ const READ_ONLY_TOOLS = [
 const EXEC_TOOLS = ["read", "bash", "edit", "write", "subagent", "project_flow_context", "project_flow_list_modules", "project_flow_read_headers", "project_flow_read_signatures", "project_flow_memory_search", "project_flow_grill_question", "project_flow_grill_cycle", "project_flow_finish"];
 const WEB_TOOLS = ["web_search", "code_search", "fetch_content", "get_search_content"];
 const OLD_RISK_NAMES = ["plan_save", "pf-doctor", "get_subagent_result", "steer_subagent", "Agent"];
-const VALIDATION_CWD = normalizePath(process.env.PI_PROJECT_FLOW_VALIDATION_CWD || process.env.PI_PROJECT_FLOW_TEST_CWD || "");
-const DEV_FLOW_ROOT = normalizePath(process.env.PI_PROJECT_FLOW_DEV_ROOT || "");
+const GLOBAL_ENV = readDotEnv(join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), ".env"));
+const GLOBAL_PROJECT_FLOW_ENV = readDotEnv(join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "project-flow.env"));
+const FLOW_ENV = { ...GLOBAL_ENV, ...GLOBAL_PROJECT_FLOW_ENV, ...process.env };
+const VALIDATION_CWD = normalizePath(FLOW_ENV.PI_PROJECT_FLOW_VALIDATION_CWD || FLOW_ENV.PI_PROJECT_FLOW_TEST_CWD || "");
+const REPO_FLOW_ROOT = normalizePath(FLOW_ENV.PI_PROJECT_FLOW_REPO || FLOW_ENV.PROJECT_FLOW_REPO || "");
+const DEV_FLOW_ROOT = normalizePath(FLOW_ENV.PI_PROJECT_FLOW_DEV_ROOT || REPO_FLOW_ROOT || "");
 const SELF_TEST_DIR = `${ROOT_DIR}/self-test`;
 const SLASH_SUBAGENT_REQUEST_EVENT = "subagent:slash:request";
 const SLASH_SUBAGENT_RESPONSE_EVENT = "subagent:slash:response";
 const SLASH_SUBAGENT_STARTED_EVENT = "subagent:slash:started";
-const PF_WORKER_MODEL = process.env.PI_PROJECT_FLOW_WORKER_MODEL || process.env.PI_PROJECT_FLOW_CHEAP_MODEL || "";
-const PF_REVIEW_MODEL = process.env.PI_PROJECT_FLOW_REVIEW_MODEL || process.env.PI_PROJECT_FLOW_EXPENSIVE_MODEL || "";
-const MAX_SAFE_CARGO_JOBS = Number(process.env.PI_PROJECT_FLOW_MAX_CARGO_JOBS || "2");
+const PF_WORKER_MODEL = FLOW_ENV.PI_PROJECT_FLOW_WORKER_MODEL || FLOW_ENV.PI_PROJECT_FLOW_CHEAP_MODEL || "";
+const PF_REVIEW_MODEL = FLOW_ENV.PI_PROJECT_FLOW_REVIEW_MODEL || FLOW_ENV.PI_PROJECT_FLOW_EXPENSIVE_MODEL || "";
+const MAX_SAFE_CARGO_JOBS = Number(FLOW_ENV.PI_PROJECT_FLOW_MAX_CARGO_JOBS || "2");
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const PACKAGE_FLOW_DIR = join(EXTENSION_DIR, "..", "..", "project-flow");
+const EXTENSION_REPO_ROOT = normalizePath(join(EXTENSION_DIR, "..", "..", ".."));
+const SOURCE_FLOW_ROOT = DEV_FLOW_ROOT || REPO_FLOW_ROOT || EXTENSION_REPO_ROOT;
+const PACKAGE_FLOW_DIR = join(SOURCE_FLOW_ROOT, ".pi", "project-flow");
 
 let state: SessionState = {
   id: "none",
   phase: "idle",
   updatedAt: new Date().toISOString(),
 };
+
+function readDotEnv(path: string): Record<string, string> {
+  if (!existsSync(path)) return {};
+  const out: Record<string, string> = {};
+  for (const rawLine of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (!match) continue;
+    let value = match[2].trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    out[match[1]] = value;
+  }
+  return out;
+}
 
 function normalizePath(input: string): string {
   return input.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -373,7 +397,9 @@ function cargoSafetyReason(command: string): string | undefined {
 
 function renderWelcomeHeader(ctx: ExtensionContext): void {
   if (!ctx.hasUI) return;
-  const artPath = join(ctx.cwd, WELCOME_ART_PATH);
+  const sourceArtPath = join(PACKAGE_FLOW_DIR, "welcome-art.md");
+  const projectArtPath = join(ctx.cwd, WELCOME_ART_PATH);
+  const artPath = existsSync(sourceArtPath) ? sourceArtPath : projectArtPath;
   if (!existsSync(artPath)) return;
   const raw = readFileSync(artPath, "utf8").trim();
   const lines = raw
@@ -606,7 +632,8 @@ function projectFlowPlanningRules(): string {
     "- For ambiguous prompts, use project_flow_context and/or project_flow_memory_search only for relevant lazy context before asking; do not load heavy docs by default.",
     "- If web/current docs would materially affect dependency/framework choice or API correctness, use pi-web-access before saving a build-ready plan.",
     "- Do not hide major assumptions in a build-ready plan. If blocking questions remain after the full blocker sweep and grill loop, call project_flow_save_plan with status blocked or draft, unresolvedQuestions, blockerAnalysisSummary, and grillResolutionSummary if any grill rounds occurred; build choices will be withheld.",
-    "- If enough information exists, produce a GSD-style plan with milestones, slices, owned files, decisions, risks, and validation.",
+    "- If you use scout, researcher, reviewer, pi-web-access, or substantial local inspection during planning, persist the useful result inside the saved plan under a concise `## Planning Evidence` section: source/tool or artifact, key findings, files/URLs checked, and how it changes the plan. Do not rely on invisible parent reasoning or transient chat context.",
+    "- If enough information exists, produce a GSD-style plan with milestones, slices, owned files, decisions, risks, and validation. Include enough slice/risk/validation evidence that build modes can reuse the plan instead of re-scouting.",
     `- For Rust/Cargo plans, include Cargo safety in validation: heavy Cargo commands must use an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower, prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}, and mark cargo run for graphical/interactive apps as manual unless explicitly approved.`,
     "- Save the plan by calling project_flow_save_plan.",
     "- Do not start implementation until the post-plan choice explicitly approves build.",
@@ -631,6 +658,44 @@ ${sessionNotesContext(cwd)}
 </project-flow-session-context>`;
 }
 
+function planSection(body: string, heading: RegExp, maxChars = 3000): string {
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex(line => heading.test(line));
+  if (start < 0) return "";
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^#{1,3}\s+/.test(lines[i])) { end = i; break; }
+  }
+  return lines.slice(start, end).join("\n").slice(0, maxChars);
+}
+
+function planHasUsefulSection(body: string, heading: RegExp): boolean {
+  const section = planSection(body, heading, 1200).toLowerCase();
+  if (!section) return false;
+  return !/\b(none|n\/a|not applicable|no known|no additional)\b/.test(section) || section.length > 240;
+}
+
+function renderPlanChoiceWidget(ctx: ExtensionContext, planPath: string, planBody: string): void {
+  const preview = planBody
+    .replace(/^---[\s\S]*?---\s*/m, "")
+    .split(/\r?\n/)
+    .filter(line => line.trim())
+    .slice(0, 18);
+  ctx.ui.setWidget(WIDGET_KEY, (_tui, theme) => ({
+    invalidate() {},
+    render(width: number) {
+      const border = "-".repeat(Math.max(12, Math.min(width, 88)));
+      return [
+        theme.fg("borderMuted", border),
+        `${theme.fg("accent", "PROJECT FLOW PLAN READY")} ${theme.fg("dim", rel(ctx.cwd, planPath))}`,
+        ...preview.map(line => theme.fg(/^#/.test(line) ? "toolTitle" : "text", truncateToWidth(line, width))),
+        theme.fg("dim", "Review the plan preview above, then choose the build mode below."),
+        theme.fg("borderMuted", border),
+      ];
+    },
+  }));
+}
+
 async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath: string): Promise<void> {
   state.phase = "plan_ready";
   state.planPath = planPath;
@@ -638,6 +703,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
   renderWidget(ctx);
 
   const planBody = existsSync(planPath) ? readFileSync(planPath, "utf8") : "Plan file not found.";
+  renderPlanChoiceWidget(ctx, planPath, planBody);
   pi.sendMessage({
     customType: "project-flow-plan-review",
     content: `# Project Flow Plan Review\n\nPlan file: ${rel(ctx.cwd, planPath)}\n\n${planBody.slice(0, 30000)}${planBody.length > 30000 ? "\n\n[Plan truncated in review message; open the file for full content.]" : ""}`,
@@ -662,7 +728,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     saveState(ctx.cwd);
     renderWidget(ctx);
     setTools(pi, EXEC_TOOLS);
-    queueUserMessage(pi, `[PROJECT FLOW: BUILD APPROVED]\nPlan file: ${rel(ctx.cwd, planPath)}\n\nBuild from the saved plan. Keep scope tight. Use edits only for plan-approved changes. Run relevant validation and report changed files, results, blockers, and follow-ups. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. When validation evidence is known, call project_flow_finish with status complete or failed.`);
+    queueUserMessage(pi, `[PROJECT FLOW: BUILD APPROVED]\nPlan file: ${rel(ctx.cwd, planPath)}\n\nBuild from the saved plan. Keep scope tight. Use edits only for plan-approved changes. Reuse any Planning Evidence, slices, risks, and validation sections in the saved plan; do not repeat scouting/research unless that evidence is missing, stale, or contradicted by the current repo state. Run relevant validation and report changed files, results, blockers, and follow-ups. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. When validation evidence is known, call project_flow_finish with status complete or failed.`);
     return;
   }
 
@@ -685,7 +751,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
 
     const bridge = await requestSubagentBridge(pi, withModel({
       agent: "worker",
-      task: `[PROJECT FLOW: SUBAGENT BUILD]\nPlan file: ${rel(ctx.cwd, planPath)}\n\nRead the written plan and implement only plan-approved changes. Keep scope tight. Validate and return changed files, validation evidence, blockers, and follow-ups. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record. Use only tools/skills needed for this plan; do not inherit or assume parent-only context.`, 
+      task: `[PROJECT FLOW: SUBAGENT BUILD]\nPlan file: ${rel(ctx.cwd, planPath)}\n\nRead the written plan and implement only plan-approved changes. Keep scope tight. Reuse any Planning Evidence, slices, risks, and validation sections in the saved plan; do not repeat scouting/research unless that evidence is missing, stale, or contradicted by the current repo state. Validate and return changed files, validation evidence, blockers, and follow-ups. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record. Use only tools/skills needed for this plan; do not inherit or assume parent-only context.`, 
       reads: [rel(ctx.cwd, planPath)],
       skill: false,
       context: "fresh",
@@ -719,81 +785,98 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     setTools(pi, ["read", "bash", "subagent", "project_flow_finish", "project_flow_context", "project_flow_list_modules", "project_flow_read_headers", "project_flow_read_signatures", "project_flow_memory_search"]);
 
     const planRel = rel(ctx.cwd, planPath);
+    const hasEvidence = planHasUsefulSection(planBody, /^#{1,3}\s+(Planning Evidence|Evidence|Context Evidence|Research Evidence)\b/i);
+    const hasSlices = planHasUsefulSection(planBody, /^#{1,3}\s+(GSD|Milestones|Slices|Tasks|Files to Modify|Implementation Plan)\b/i) || hasEvidence;
+    const hasRisks = planHasUsefulSection(planBody, /^#{1,3}\s+(Risks|Risk|Assumptions|Decisions|Scope)\b/i) || hasEvidence;
+    const hasValidation = planHasUsefulSection(planBody, /^#{1,3}\s+(Validation|Acceptance|Testing|Verification)\b/i) || hasEvidence;
+    const preflight: any[] = [];
+    if (!hasSlices) {
+      preflight.push({
+        agent: "scout",
+        phase: "GSD planning",
+        label: "Codebase slice map",
+        as: "codeSlices",
+        task: `[PROJECT FLOW: GSD CODEBASE SLICES]\nPlan file: ${planRel}\n\nThe saved plan does not contain enough implementation-slice/context evidence. Read the plan and follow the Codebase Reading Protocol before deeper inspection: project_flow_list_modules, project_flow_read_headers for relevant files, project_flow_read_signatures, then selective full read only if needed. Inspect only the files needed to map implementation slices. Do not modify project/source files. Return clear GSD slices: slice name, owned files, dependencies/order, likely conflicts, and first file to open for each slice.`,
+        reads: [planRel],
+        output: "gsd/code-slices.md",
+        outputMode: "file-only",
+      });
+    }
+    if (!hasRisks) {
+      preflight.push({
+        agent: "reviewer",
+        phase: "GSD planning",
+        label: "Plan risk and scope check",
+        as: "riskPlan",
+        task: `[PROJECT FLOW: GSD RISK CHECK]\nPlan file: ${planRel}\n\nThe saved plan does not contain enough risk/scope-review evidence. Review it for implementation risks before writing. Do not modify project/source files. Identify blockers, hidden decisions, scope creep risks, and smallest safe sequencing for a single writer worker.`,
+        reads: [planRel],
+        output: "gsd/risk-plan.md",
+        outputMode: "file-only",
+      });
+    }
+    if (!hasValidation) {
+      preflight.push({
+        agent: "reviewer",
+        phase: "GSD planning",
+        label: "Validation plan",
+        as: "validationPlan",
+        task: `[PROJECT FLOW: GSD VALIDATION PLAN]\nPlan file: ${planRel}\n\nThe saved plan does not contain enough validation evidence. Produce focused validation/doc/memory checks. Do not modify project/source files. Include exact commands when possible. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved.`,
+        reads: [planRel],
+        output: "gsd/validation-plan.md",
+        outputMode: "file-only",
+      });
+    }
+
+    const planningEvidence = planSection(planBody, /^#{1,3}\s+(Planning Evidence|Evidence|Context Evidence|Research Evidence)\b/i);
+    const relayedEvidence = [
+      planningEvidence ? `Saved planning evidence:\n${planningEvidence}` : "",
+      hasSlices ? `Saved plan slice/task evidence:\n${planSection(planBody, /^#{1,3}\s+(GSD|Milestones|Slices|Tasks|Files to Modify|Implementation Plan)\b/i) || planningEvidence}` : "Additional code-slice evidence from preflight:\n{outputs.codeSlices}",
+      hasRisks ? `Saved plan risk/scope evidence:\n${planSection(planBody, /^#{1,3}\s+(Risks|Risk|Assumptions|Decisions|Scope)\b/i) || planningEvidence}` : "Additional risk/scope evidence from preflight:\n{outputs.riskPlan}",
+      hasValidation ? `Saved plan validation evidence:\n${planSection(planBody, /^#{1,3}\s+(Validation|Acceptance|Testing|Verification)\b/i) || planningEvidence}` : "Additional validation evidence from preflight:\n{outputs.validationPlan}",
+    ].filter(Boolean).join("\n\n");
+
+    const chain: any[] = [];
+    if (preflight.length) chain.push({ parallel: preflight, concurrency: Math.min(3, preflight.length) });
+    chain.push({
+      agent: "worker",
+      phase: "Implementation",
+      label: "Single writer implementation",
+      as: "workerResult",
+      task: `[PROJECT FLOW: GSD SINGLE WRITER BUILD]\nPlan file: ${planRel}\n\nImplement only plan-approved changes. You are the sole writer for the active worktree. Use the relayed saved-plan evidence and any preflight summaries below to sequence work, but do not expand scope or make unapproved product/architecture decisions. If a blocker or unapproved decision is required, stop and report it. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Validate with focused checks. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.\n\n${relayedEvidence}`,
+      reads: [planRel],
+      output: "gsd/worker-result.md",
+      outputMode: "file-only",
+      progress: true,
+    });
+    chain.push({
+      parallel: [
+        {
+          agent: "reviewer",
+          phase: "Validation",
+          label: "Implementation validation",
+          task: `Validate the post-worker diff against the saved plan ${planRel}. Start from worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report blockers, fixes worth doing now, and validation gaps.`,
+          reads: [planRel],
+          output: "gsd/implementation-validation.md",
+          outputMode: "file-only",
+        },
+        {
+          agent: "reviewer",
+          phase: "Validation",
+          label: "Scope and docs validation",
+          task: `Validate scope control, docs/memory needs, and regression risk after the worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report only evidence-backed issues with file references.`,
+          reads: [planRel],
+          output: "gsd/scope-docs-validation.md",
+          outputMode: "file-only",
+        },
+      ],
+      concurrency: 2,
+    });
+
     const bridge = await requestSubagentBridge(pi, {
       context: "fresh",
       async: true,
       agentScope: "both",
-      chain: [
-        {
-          parallel: [
-            {
-              agent: "scout",
-              phase: "GSD planning",
-              label: "Codebase slice map",
-              as: "codeSlices",
-              task: `[PROJECT FLOW: GSD CODEBASE SLICES]\nPlan file: ${planRel}\n\nRead the plan and follow the Codebase Reading Protocol before deeper inspection: project_flow_list_modules, project_flow_read_headers for relevant files, project_flow_read_signatures, then selective full read only if needed. Inspect only the files needed to map implementation slices. Do not modify project/source files. Return clear GSD slices: slice name, owned files, dependencies/order, likely conflicts, and first file to open for each slice.`,
-              reads: [planRel],
-              output: "gsd/code-slices.md",
-              outputMode: "file-only",
-            },
-            {
-              agent: "reviewer",
-              phase: "GSD planning",
-              label: "Plan risk and scope check",
-              as: "riskPlan",
-              task: `[PROJECT FLOW: GSD RISK CHECK]\nPlan file: ${planRel}\n\nReview the saved plan for implementation risks before writing. Do not modify project/source files. Identify blockers, hidden decisions, scope creep risks, and smallest safe sequencing for a single writer worker.`,
-              reads: [planRel],
-              output: "gsd/risk-plan.md",
-              outputMode: "file-only",
-            },
-            {
-              agent: "reviewer",
-              phase: "GSD planning",
-              label: "Validation plan",
-              as: "validationPlan",
-              task: `[PROJECT FLOW: GSD VALIDATION PLAN]\nPlan file: ${planRel}\n\nReview the saved plan and produce focused validation/doc/memory checks. Do not modify project/source files. Include exact commands when possible. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved.`,
-              reads: [planRel],
-              output: "gsd/validation-plan.md",
-              outputMode: "file-only",
-            },
-          ],
-          concurrency: 3,
-        },
-        {
-          agent: "worker",
-          phase: "Implementation",
-          label: "Single writer implementation",
-          as: "workerResult",
-          task: `[PROJECT FLOW: GSD SINGLE WRITER BUILD]\nPlan file: ${planRel}\n\nImplement only plan-approved changes. You are the sole writer for the active worktree. Use the GSD slice/risk/validation summaries below to sequence work, but do not expand scope or make unapproved product/architecture decisions. If a blocker or unapproved decision is required, stop and report it. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Validate with focused checks. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.\n\nCode slices:\n{outputs.codeSlices}\n\nRisk plan:\n{outputs.riskPlan}\n\nValidation plan:\n{outputs.validationPlan}`,
-          reads: [planRel],
-          output: "gsd/worker-result.md",
-          outputMode: "file-only",
-          progress: true,
-        },
-        {
-          parallel: [
-            {
-              agent: "reviewer",
-              phase: "Validation",
-              label: "Implementation validation",
-              task: `Validate the post-worker diff against the saved plan ${planRel}. Start from worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report blockers, fixes worth doing now, and validation gaps.`,
-              reads: [planRel],
-              output: "gsd/implementation-validation.md",
-              outputMode: "file-only",
-            },
-            {
-              agent: "reviewer",
-              phase: "Validation",
-              label: "Scope and docs validation",
-              task: `Validate scope control, docs/memory needs, and regression risk after the worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report only evidence-backed issues with file references.`,
-              reads: [planRel],
-              output: "gsd/scope-docs-validation.md",
-              outputMode: "file-only",
-            },
-          ],
-          concurrency: 2,
-        },
-      ],
+      chain,
     });
 
     if (!bridge.ok) {
@@ -1247,6 +1330,7 @@ export default function projectFlow(pi: ExtensionAPI): void {
         [join(sourceRoot, ".pi/project-flow/README.md"), join(ctx.cwd, ".pi/project-flow/README.md")],
         [join(sourceRoot, ".pi/project-flow/VALIDATION.md"), join(ctx.cwd, ".pi/project-flow/VALIDATION.md")],
         [join(sourceRoot, ".pi/project-flow/self-validate.mjs"), join(ctx.cwd, ".pi/project-flow/self-validate.mjs")],
+        [join(sourceRoot, ".pi/project-flow/welcome-art.md"), join(ctx.cwd, ".pi/project-flow/welcome-art.md")],
         [join(sourceRoot, ".pi/themes/relay-concrete-dim.json"), join(ctx.cwd, ".pi/themes/relay-concrete-dim.json")],
       ];
       for (const [from, to] of pairs) {

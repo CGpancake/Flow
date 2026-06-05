@@ -23,7 +23,13 @@ function readDotEnv(path) {
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const defaultRepo = resolve(scriptDir, "..");
-const env = { ...readDotEnv(join(defaultRepo, ".env")), ...process.env };
+const globalAgentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+const env = {
+  ...readDotEnv(join(defaultRepo, ".env")),
+  ...readDotEnv(join(globalAgentDir, ".env")),
+  ...readDotEnv(join(globalAgentDir, "project-flow.env")),
+  ...process.env,
+};
 const repo = resolve(env.PI_PROJECT_FLOW_REPO || env.PROJECT_FLOW_REPO || defaultRepo);
 const target = join(repo, ".pi", "extensions", "project-flow");
 const link = join(homedir(), ".pi", "agent", "extensions", "project-flow");
