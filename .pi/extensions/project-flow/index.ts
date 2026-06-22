@@ -104,6 +104,10 @@ const SLASH_SUBAGENT_RESPONSE_EVENT = "subagent:slash:response";
 const SLASH_SUBAGENT_STARTED_EVENT = "subagent:slash:started";
 const PF_WORKER_MODEL = FLOW_ENV.PI_PROJECT_FLOW_WORKER_MODEL || FLOW_ENV.PI_PROJECT_FLOW_CHEAP_MODEL || "";
 const PF_REVIEW_MODEL = FLOW_ENV.PI_PROJECT_FLOW_REVIEW_MODEL || FLOW_ENV.PI_PROJECT_FLOW_EXPENSIVE_MODEL || "";
+const PF_GSD_SCOUT_MODEL = FLOW_ENV.PI_PROJECT_FLOW_GSD_SCOUT_MODEL || "";
+const PF_GSD_SCOUT_THINKING = FLOW_ENV.PI_PROJECT_FLOW_GSD_SCOUT_THINKING || "";
+const PF_GSD_WORKER_THINKING = FLOW_ENV.PI_PROJECT_FLOW_GSD_WORKER_THINKING || FLOW_ENV.PI_PROJECT_FLOW_GSD_THINKING || FLOW_ENV.PI_PROJECT_FLOW_WORKER_THINKING || FLOW_ENV.PI_PROJECT_FLOW_THINKING || "";
+const PF_GSD_REVIEW_THINKING = FLOW_ENV.PI_PROJECT_FLOW_GSD_REVIEW_THINKING || FLOW_ENV.PI_PROJECT_FLOW_GSD_THINKING || FLOW_ENV.PI_PROJECT_FLOW_REVIEW_THINKING || FLOW_ENV.PI_PROJECT_FLOW_THINKING || "";
 const MAX_SAFE_CARGO_JOBS = Number(FLOW_ENV.PI_PROJECT_FLOW_MAX_CARGO_JOBS || "2");
 const GSD_MAX_AUTOFIX_ATTEMPTS = Number(FLOW_ENV.PI_PROJECT_FLOW_GSD_MAX_AUTOFIX_ATTEMPTS || "3");
 const GSD_MAX_CONTINUE_TASKS = Math.min(15, Math.max(1, Number(FLOW_ENV.PI_PROJECT_FLOW_GSD_MAX_CONTINUE_TASKS || "15")));
@@ -149,6 +153,48 @@ function devFlowRoot(ctx: ExtensionContext): string {
 
 function safeSlug(input: string): string {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 72) || "project-flow-plan";
+}
+
+function shortGsdTitle(input: string): string {
+  const stem = input.split(/[\\/]/).pop()?.replace(/\.[a-z0-9]+$/i, "") || input;
+  const words = stem
+    .replace(/^\d{4}-\d{2}-\d{2}[-_ ]*/, "")
+    .replace(/[^a-zA-Z0-9+/#]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(word => word && !/^(the|and|or|to|for|with|from|into|then|this|that|gsd|task|atomic|start|continue|project|flow|plan)$/i.test(word));
+  return words.slice(0, 3).join(" ") || "next slice";
+}
+
+function extractGsdTaskTitles(planBody: string, fallbackSeed: string, max: number): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string): void => {
+    const title = shortGsdTitle(raw.replace(/[`*_()[\]{}]/g, " "));
+    const key = title.toLowerCase();
+    if (!title || key === "next slice" || seen.has(key)) return;
+    seen.add(key);
+    out.push(title);
+  };
+  let inLikelyGsdSection = false;
+  for (const rawLine of planBody.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const heading = line.match(/^#{1,6}\s+(.+)$/)?.[1]?.trim();
+    if (heading) {
+      inLikelyGsdSection = /\b(gsd|milestones?|slices?|tasks?|implementation plan|continuation chain|maximal safe)\b/i.test(heading);
+      if (/\b(slice|task|milestone)\b/i.test(heading)) add(heading);
+      continue;
+    }
+    if (!inLikelyGsdSection) continue;
+    const bold = line.match(/^[-*]?\s*(?:\d+[.)]\s*)?\*\*([^*]{4,120})\*\*/)?.[1];
+    const named = line.match(/^(?:[-*]\s*)?(?:\d+[.)]\s*)?(?:Auto\s+)?(?:Task|Slice|Milestone)\s+[\w./-]*\s*(?:[—:-]\s*)(.{4,120})$/i)?.[1];
+    if (bold) add(bold);
+    else if (named) add(named);
+    if (out.length >= max) return out.slice(0, max);
+  }
+  if (!out.length) add(fallbackSeed);
+  while (out.length < max) out.push(`${out[0] || "Planned slice"} ${out.length + 1}`);
+  return out.slice(0, max);
 }
 
 function stamp(): string {
@@ -389,6 +435,14 @@ function missing(names: Set<string>, wanted: string[]): string[] {
 
 function withModel(params: Record<string, unknown>, model: string): Record<string, unknown> {
   return model ? { ...params, model } : params;
+}
+
+function withThinking(params: Record<string, unknown>, thinking: string): Record<string, unknown> {
+  return thinking ? { ...params, thinking } : params;
+}
+
+function withModelAndThinking(params: Record<string, unknown>, model: string, thinking: string): Record<string, unknown> {
+  return withThinking(withModel(params, model), thinking);
 }
 
 function setTools(pi: ExtensionAPI, wanted: string[]): void {
@@ -1071,6 +1125,7 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
   setTools(pi, ["read", "bash", "subagent", "project_flow_finish", "project_flow_context", "project_flow_list_modules", "project_flow_read_headers", "project_flow_read_signatures", "project_flow_memory_search"]);
 
   const planRel = rel(ctx.cwd, planPath);
+  const planBody = existsSync(planPath) ? readFileSync(planPath, "utf8") : "";
   const evidenceFiles = gsdEvidenceFiles(ctx.cwd);
   const evidenceList = evidenceFiles.length ? evidenceFiles.map(p => `- ${p}`).join("\n") : "- No existing gsd/*.md evidence files found.";
   const resumeTarget = target || "Continue from the first pending milestone/slice after reconciling existing evidence.";
@@ -1095,6 +1150,7 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
     maxFinalizationTurns: GSD_MAX_AUTOFIX_ATTEMPTS,
   };
 
+  const taskTitles = extractGsdTaskTitles(planBody, resumeTarget || planRel, GSD_MAX_CONTINUE_TASKS);
   const chainSummary = [
     "# Project Flow GSD Continue Chain",
     "",
@@ -1107,6 +1163,8 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
     "Steps that will run:",
     "1. Continuation planning (scout): read the plan and existing gsd/*.md evidence; write gsd/resume-ledger.md with completed/pending/blocked/manual checkpoint status plus the maximal safe dependency-ordered atomic task chain.",
     `2. Atomic task execution: run up to ${GSD_MAX_CONTINUE_TASKS} fresh worker steps, each executing at most one planned atomic task and writing gsd/continue-task-XX.md.`,
+    "   Worker status labels:",
+    ...taskTitles.map((title, index) => `   - ${index + 1}. ${title}`),
     "3. Validation fanout (reviewers): verify no completed work was redone, workers followed the planned chain one atomic task at a time, validation evidence is sufficient, and deferred human checks/manual checkpoints/next steps are actionable.",
     "",
     "Stop conditions:",
@@ -1118,22 +1176,22 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
     const n = i + 1;
     const as = `continueTask${n}`;
     const priorOutputs = Array.from({ length: i }, (_v, j) => `## Prior atomic worker ${j + 1}\n{outputs.continueTask${j + 1}}`).join("\n\n") || "No prior atomic task workers in this /gsd-continue run.";
-    return {
+    return withModelAndThinking({
       agent: "worker",
       phase: "Implementation",
-      label: `Atomic GSD task ${n}`,
+      label: taskTitles[i] ?? `Planned slice ${n}`,
       as,
       task: `[PROJECT FLOW: GSD ATOMIC TASK ${n}]\nPlan file: ${planRel}\nResume target: ${resumeTarget}\n\n${gsdRules}\n\nResume ledger and continuation plan:\n{outputs.resumeLedger}\n\nPrior atomic task results:\n${priorOutputs}\n\nExecute at most ONE next atomic auto task from the Maximal Safe Continuation Chain in gsd/resume-ledger.md. Start fresh: use the ledger and prior atomic task results to identify the first uncompleted planned task that is not blocked. Do not redo completed work. Do not execute two tasks in one worker, even if the next task is small. If no planned task remains, or all remaining tasks are blocked by prior results, write a no-op handoff saying the chain is complete or blocked and do not modify source files.\n\nDo not stop for deferrable human-check/UAT items; record them for end-of-chain review unless later work truly depends on the human result. Stop this task only at a true blocker: required user decision, auth/secret/manual action, package-legitimacy check, destructive operation, unapproved product/architecture decision, or human verification whose result is required before later work can safely proceed. If the current task is blocked but a later independent planned task can safely progress, skip the blocked task with exact rationale and execute that one independent task instead.\n\nValidate the task with focused checks before handoff. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.`,
       reads: [planRel, ...evidenceFiles],
       output: `gsd/continue-task-${String(n).padStart(2, "0")}.md`,
       outputMode: "file-only",
       progress: true,
-    };
+    }, PF_WORKER_MODEL, PF_GSD_WORKER_THINKING);
   });
   const atomicTaskOutputRefs = atomicWorkerSteps.map((_step, i) => `## Atomic worker ${i + 1}\n{outputs.continueTask${i + 1}}`).join("\n\n");
 
   const chain: any[] = [
-    {
+    withModelAndThinking({
       agent: "scout",
       phase: "Continuation planning",
       label: "GSD resume ledger and continuation plan",
@@ -1142,11 +1200,11 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
       reads: [planRel, ...evidenceFiles],
       output: "gsd/resume-ledger.md",
       outputMode: "file-only",
-    },
+    }, PF_GSD_SCOUT_MODEL, PF_GSD_SCOUT_THINKING),
     ...atomicWorkerSteps,
     {
       parallel: [
-        {
+        withModelAndThinking({
           agent: "reviewer",
           phase: "Validation",
           label: "Resume/implementation validation",
@@ -1155,8 +1213,8 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
           reads: [planRel],
           output: "gsd/continue-validation.md",
           outputMode: "file-only",
-        },
-        {
+        }, PF_REVIEW_MODEL, PF_GSD_REVIEW_THINKING),
+        withModelAndThinking({
           agent: "reviewer",
           phase: "Validation",
           label: "Scope/manual checkpoint validation",
@@ -1165,7 +1223,7 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
           reads: [planRel],
           output: "gsd/continue-scope-validation.md",
           outputMode: "file-only",
-        },
+        }, PF_REVIEW_MODEL, PF_GSD_REVIEW_THINKING),
       ],
       concurrency: 2,
     },
