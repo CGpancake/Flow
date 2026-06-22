@@ -111,6 +111,10 @@ export PI_PROJECT_FLOW_VALIDATION_CWD="/path/to/Flow-test"
 # Optional model routing for worker/review tasks
 export PI_PROJECT_FLOW_WORKER_MODEL="provider/model-id"
 export PI_PROJECT_FLOW_REVIEW_MODEL="provider/model-id"
+
+# Optional GSD thinking override for atomic worker/reviewer chains; scout keeps its default unless set separately
+export PI_PROJECT_FLOW_GSD_THINKING="medium"
+# export PI_PROJECT_FLOW_GSD_SCOUT_THINKING="low"
 ```
 
 Windows PowerShell equivalent:
