@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -105,6 +105,8 @@ const SLASH_SUBAGENT_STARTED_EVENT = "subagent:slash:started";
 const PF_WORKER_MODEL = FLOW_ENV.PI_PROJECT_FLOW_WORKER_MODEL || FLOW_ENV.PI_PROJECT_FLOW_CHEAP_MODEL || "";
 const PF_REVIEW_MODEL = FLOW_ENV.PI_PROJECT_FLOW_REVIEW_MODEL || FLOW_ENV.PI_PROJECT_FLOW_EXPENSIVE_MODEL || "";
 const MAX_SAFE_CARGO_JOBS = Number(FLOW_ENV.PI_PROJECT_FLOW_MAX_CARGO_JOBS || "2");
+const GSD_MAX_AUTOFIX_ATTEMPTS = Number(FLOW_ENV.PI_PROJECT_FLOW_GSD_MAX_AUTOFIX_ATTEMPTS || "3");
+const GSD_MAX_CONTINUE_TASKS = Math.min(15, Math.max(1, Number(FLOW_ENV.PI_PROJECT_FLOW_GSD_MAX_CONTINUE_TASKS || "15")));
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const EXTENSION_REPO_ROOT = normalizePath(join(EXTENSION_DIR, "..", "..", ".."));
 const SOURCE_FLOW_ROOT = DEV_FLOW_ROOT || REPO_FLOW_ROOT || EXTENSION_REPO_ROOT;
@@ -278,6 +280,27 @@ function grillResolutionMissingRefs(summary: string): string[] {
   });
 }
 
+function grillAnswerLog(): string {
+  const rounds = state.grillRounds ?? [];
+  if (!rounds.length) return "";
+  return [
+    "## Grill Answer Log",
+    "",
+    ...rounds.flatMap((round, i) => [
+      `### Grill Round ${i + 1}`,
+      "",
+      `- Question: ${round.question}`,
+      `- Reason: ${round.reason}`,
+      `- Recommendation: ${round.recommendation}`,
+      `- Answer: ${round.answer}`,
+      `- Answered at: ${round.answeredAt}`,
+      round.defaultAssumption ? `- Default assumption: ${round.defaultAssumption}` : "",
+      round.mergeWarning ? `- Note: ${round.mergeWarning}` : "",
+      "",
+    ].filter(Boolean)),
+  ].join("\n");
+}
+
 function obviousUnresolvedLanguage(markdown: string): boolean {
   return /\b(todo:|tbd|needs user|awaiting|blocked by|open question|must ask)\b/i.test(markdown);
 }
@@ -393,6 +416,33 @@ function cargoSafetyReason(command: string): string | undefined {
   if (!jobs) return `Project Flow Cargo safety requires an explicit job limit for heavy Cargo commands, e.g. cargo check -j ${MAX_SAFE_CARGO_JOBS}.`;
   if (jobs > MAX_SAFE_CARGO_JOBS) return `Project Flow Cargo safety limits heavy Cargo commands to -j ${MAX_SAFE_CARGO_JOBS} or lower; requested ${jobs}.`;
   return undefined;
+}
+
+function planningCommandReason(command: string): string | undefined {
+  const trimmed = command.trim();
+  if (!trimmed) return undefined;
+  if (/\b(npm|pnpm|yarn|bun)\s+(test|run\s+(test|build|check|lint|typecheck)|build|check)\b/i.test(trimmed)) {
+    return "Project Flow planning must not run test/build/validation commands. In plan mode, inspect read-only context and write the validation plan instead.";
+  }
+  if (/\b(cargo\s+(build|check|clippy|test|run|install|bench)|go\s+test|pytest|mvn\s+test|gradle\s+test|make\s+(test|check|build))\b/i.test(trimmed)) {
+    return "Project Flow planning must not run test/build/validation commands. In plan mode, inspect read-only context and write the validation plan instead.";
+  }
+  return undefined;
+}
+
+function planningSubagentReason(input: any): string | undefined {
+  const text = JSON.stringify(input ?? {}).toLowerCase();
+  if (/"agent"\s*:\s*"(worker|validator)"/.test(text)) {
+    return "Project Flow planning may only delegate read-only scout/research/review support, not worker/validator execution.";
+  }
+  if (/\b(run|execute)\b[^\n]{0,80}\b(test|tests|build|check|clippy|typecheck|lint)\b/.test(text)) {
+    return "Project Flow planning subagents must not run tests/builds/checks; ask them for read-only inspection and validation recommendations only.";
+  }
+  return undefined;
+}
+
+function fitLine(line: string, width: number): string {
+  return visibleWidth(line) > width ? truncateToWidth(line, width) : line;
 }
 
 function renderWelcomeHeader(ctx: ExtensionContext): void {
@@ -620,11 +670,12 @@ function projectFlowPlanningRules(): string {
     "- Before creating any module/tool/function/system, follow the Codebase Reading Protocol: project_flow_list_modules, then project_flow_read_headers for relevant files, then project_flow_read_signatures, and only then full read if still needed.",
     "- Inspect shallow-first with read-only tools.",
     "- Use project_flow_memory_search for long-term memory lookups instead of loading large memory/log files.",
+    "- Planning mode is planning only: do not run tests, builds, checkers, validators, implementation workers, or auto-fix loops. Inspect read-only context, then write the validation/check plan that the later build phase should run.",
     "- Use pi-web-access tools only if research materially improves the plan.",
     "- Research gate: before using pi-web-access or launching researcher, identify the missing external fact, why repo inspection/project memory cannot answer it, and how the answer affects the plan. If no such fact exists, do not research.",
-    "- If the task is large, unfamiliar, or externally dependent, you may use the subagent tool for read-only planning support: scout for codebase reconnaissance and researcher for external/library/current-doc evidence. Keep this optional and targeted; do not spawn subagents for small obvious plans. When launching scout, explicitly require the Codebase Reading Protocol: project_flow_list_modules, project_flow_read_headers, project_flow_read_signatures, then selective full read only if needed. When launching researcher, include the research gate statement in the task and require a concise file-only or compact sourced answer.",
-    "- Before the first grill question, sketch the potential plan privately and sweep it for all build-readiness blockers you can identify. Form a blocker queue, but ask only the first unresolved blocker.",
-    "- Ask concise blocking questions through project_flow_grill_cycle when multiple current-cycle blockers are known, or project_flow_grill_question when only one blocker is known. Do not merge independent ambiguities into one question; queue them as separate question objects. Each grill question must include a single recommended answer, alternatives, a default assumption, and room for additional user context.",
+    "- If the task is large, unfamiliar, or externally dependent, you may use the subagent tool only for read-only planning support: scout for codebase reconnaissance, researcher for external/library/current-doc evidence, or reviewer for plan-risk review. Do not launch worker/validator agents and do not ask planning subagents to run tests/build/check commands. Keep this optional and targeted; do not spawn subagents for small obvious plans. When launching scout, explicitly require the Codebase Reading Protocol: project_flow_list_modules, project_flow_read_headers, project_flow_read_signatures, then selective full read only if needed. When launching researcher, include the research gate statement in the task and require a concise file-only or compact sourced answer.",
+    "- Before the first grill question, sketch the potential plan privately and sweep it for all build-readiness blockers you can identify. Form a blocker queue, then ask unresolved blockers instead of silently converting them into assumptions.",
+    "- Ask concise blocking questions through project_flow_grill_cycle when multiple current-cycle blockers are known, or project_flow_grill_question when only one blocker is known. Do not merge independent ambiguities into one question; queue them as separate question objects. Each grill question must include a single recommended answer, alternatives, a default assumption, and room for additional user context. Grill product intent, acceptance criteria, irreversible choices, destructive actions, dependency/framework choices, and locally impossible validation instead of guessing.",
     "- Grill loop requirement: precompute the current grill-cycle queue where possible so the UI can advance responsively from one concise question to the next. Keep related blockers adjacent before farther-apart topics. After the cycle is answered, plug collected answers back into the potential plan, revise blocker status, and re-sweep for blockers introduced or removed by the answers. If new blockers appear, start another grill cycle. Only then save the final plan.",
     "- When calling project_flow_save_plan, include blockerAnalysisSummary describing the blocker sweep/queue and final status. After any grill round, also include grillResolutionSummary explaining how each grill answer was incorporated. If a plan is still blocked, explain why the answered questions did not unblock it and list only genuinely unresolved questions.",
     "- Use the Grill rules: inspect relevant docs/context first, prefer reversible default assumptions, and ask only for product intent, irreversible tradeoffs, destructive actions, or locally impossible validation.",
@@ -633,15 +684,19 @@ function projectFlowPlanningRules(): string {
     "- If web/current docs would materially affect dependency/framework choice or API correctness, use pi-web-access before saving a build-ready plan.",
     "- Do not hide major assumptions in a build-ready plan. If blocking questions remain after the full blocker sweep and grill loop, call project_flow_save_plan with status blocked or draft, unresolvedQuestions, blockerAnalysisSummary, and grillResolutionSummary if any grill rounds occurred; build choices will be withheld.",
     "- If you use scout, researcher, reviewer, pi-web-access, or substantial local inspection during planning, persist the useful result inside the saved plan under a concise `## Planning Evidence` section: source/tool or artifact, key findings, files/URLs checked, and how it changes the plan. Do not rely on invisible parent reasoning or transient chat context.",
-    "- If enough information exists, produce a GSD-style plan with milestones, slices, owned files, decisions, risks, and validation. Include enough slice/risk/validation evidence that build modes can reuse the plan instead of re-scouting.",
-    `- For Rust/Cargo plans, include Cargo safety in validation: heavy Cargo commands must use an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower, prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}, and mark cargo run for graphical/interactive apps as manual unless explicitly approved.`,
+    "- If enough information exists, produce a GSD-style plan with milestones, atomic slices, tasks, owned files, decisions, risks, and validation. Include enough slice/risk/validation evidence that build modes can reuse the plan instead of re-scouting.",
+    "- GSD atomicity requirement: every slice must be independently verifiable, have one clear goal/user-visible outcome, list owned/shared files, dependencies, parallel-safety/conflict notes, stop/escalation triggers, automatic/manual validation, and required evidence.",
+    "- Keep GSD work small enough for fresh worker sessions: split large slices into atomic tasks that one worker can complete and validate in one session. If a slice touches multiple subsystems or has multiple done conditions, break it down further before saving the plan.",
+    "- Break each slice into ordered tasks. Each task must name its type (`auto`, `human-verify`, `decision`, or `human-action`), files, concrete change, done condition, validation, and auto-fix policy. Prefer `auto`; use human gates only for unavoidable user validation/action, secrets/auth, package legitimacy, destructive operations, or unapproved product/architecture decisions.",
+    "- Split slices further if they touch unrelated behavior/files, cannot be validated independently, require separate architectural decisions, or would make failure attribution unclear. Mark parallel-safe only when dependencies and owned files do not conflict.",
+    `- For Rust/Cargo plans, include Cargo safety in validation: heavy Cargo commands must use an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower, prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}, and mark cargo run for graphical/interactive apps as manual unless explicitly approved.`, 
     "- Save the plan by calling project_flow_save_plan.",
     "- Do not start implementation until the post-plan choice explicitly approves build.",
   ].join("\n");
 }
 
 function planningPrompt(task: string, context: string): string {
-  return `[PROJECT FLOW: PLAN]\nTask: ${task}\n\nYou are planning only. Do not edit files. Project Flow core owns lifecycle and build approval.\n\n${projectFlowPlanningRules()}\n\n<project-flow-memory>\n${context || "No memory yet."}\n</project-flow-memory>`;
+  return `[PROJECT FLOW: PLAN]\nTask: ${task}\n\nYou are planning only. Do not edit files, run tests/builds/checks, launch validators/workers, or try to finish by validating. Finish planning by calling project_flow_save_plan when the blocker sweep/grill loop is resolved or explicitly blocked. Project Flow core owns lifecycle and build approval.\n\n${projectFlowPlanningRules()}\n\n<project-flow-memory>\n${context || "No memory yet."}\n</project-flow-memory>`;
 }
 
 function continuePrompt(cwd: string, latestPlanPath?: string): string {
@@ -651,7 +706,7 @@ Phase: ${state.phase}
 Task: ${state.task || "unknown"}
 Plan: ${rel(cwd, latestPlanPath)}
 
-Resume the Project Flow lifecycle from this state. Session notes, grill answers, deterministic grill queue state, and the current saved plan are included below. If phase is blocked, do not merely repeat the old blocked plan: reconsider the captured grill answers and any new user context, revise the potential plan, re-sweep for all build-readiness blockers, then use project_flow_grill_cycle for multiple current-cycle blockers or project_flow_grill_question for one blocker, or save a final plan with project_flow_save_plan. Keep independent ambiguities in separate queued calls and ask related blockers before farther-apart topics. project_flow_save_plan must include blockerAnalysisSummary, and after any grill round it must also include grillResolutionSummary. If building/validating and evidence is complete, call project_flow_finish. Do not substitute a different/latest plan unless the user explicitly selects it.
+Resume the Project Flow lifecycle from this state. Session notes, grill answers, deterministic grill queue state, and the current saved plan are included below. If phase is planning or blocked, stay in planning mode: do not run tests/builds/checks, launch validators/workers, or try to finish by validating. If phase is blocked, do not merely repeat the old blocked plan: reconsider the captured grill answers and any new user context, revise the potential plan, re-sweep for all build-readiness blockers, then use project_flow_grill_cycle for multiple current-cycle blockers or project_flow_grill_question for one blocker, or save a final plan with project_flow_save_plan. Keep independent ambiguities in separate queued calls and ask related blockers before farther-apart topics. project_flow_save_plan must include blockerAnalysisSummary, and after any grill round it must also include grillResolutionSummary. If building/validating and evidence is complete, call project_flow_finish. Do not substitute a different/latest plan unless the user explicitly selects it.
 
 <project-flow-session-context>
 ${sessionNotesContext(cwd)}
@@ -687,7 +742,7 @@ function renderPlanChoiceWidget(ctx: ExtensionContext, planPath: string, planBod
       const border = "-".repeat(Math.max(12, Math.min(width, 88)));
       return [
         theme.fg("borderMuted", border),
-        `${theme.fg("accent", "PROJECT FLOW PLAN READY")} ${theme.fg("dim", rel(ctx.cwd, planPath))}`,
+        fitLine(`${theme.fg("accent", "PROJECT FLOW PLAN READY")} ${theme.fg("dim", rel(ctx.cwd, planPath))}`, width),
         ...preview.map(line => theme.fg(/^#/.test(line) ? "toolTitle" : "text", truncateToWidth(line, width))),
         theme.fg("dim", "Review the plan preview above, then choose the build mode below."),
         theme.fg("borderMuted", border),
@@ -779,6 +834,9 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
   }
 
   if (choice === "Build with GSD subagent pipeline") {
+    await launchGsdContinue(pi, ctx, planPath, "Start from the first plan-approved milestone/slice and execute the maximal safe atomic worker chain before human validation/action is truly required.");
+    return;
+
     state.phase = "build_requested";
     saveState(ctx.cwd);
     renderWidget(ctx);
@@ -835,6 +893,27 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
       hasValidation ? `Saved plan validation evidence:\n${planSection(planBody, /^#{1,3}\s+(Validation|Acceptance|Testing|Verification)\b/i) || planningEvidence}` : "Additional validation evidence from preflight:\n{outputs.validationPlan}",
     ].filter(Boolean).join("\n\n");
 
+    const gsdAutoRules = `GSD auto-mode contract:\n- Do not stop after the first slice/task. Continue through every plan-approved slice that can be completed safely.\n- Automatically fix issues directly caused by the current build work when they are bugs, missing critical correctness/security/validation, broken imports/types/config, or other blockers to completing the approved slice.\n- Make up to ${GSD_MAX_AUTOFIX_ATTEMPTS} focused auto-fix attempts for the same task/slice before deferring that local issue and moving to the next independent plan-approved slice when possible.\n- Stop only for unavoidable user validation/action, secrets/auth, package-legitimacy checks, destructive operations, unapproved product/architecture decisions, or when no independent slice can progress.\n- Record deferred issues, attempted fixes, commands, residual risks, and the exact user action needed if a stop is inevitable.\n- Final handoff must be operator-actionable: state whether the overall plan is complete, partially complete, or blocked; list completed and pending milestones/slices; list exact manual checkpoints with steps and expected results; and say the next safe instruction (for example, \"continue GSD from Milestone 2\" or \"run Manual Checkpoint A first\").`;
+
+    const gsdAcceptance = {
+      criteria: [
+        "Every plan-approved slice that can be safely completed without new user decisions is attempted; the worker does not stop merely because one slice finished.",
+        "Issues directly caused by the implementation are auto-fixed within the approved scope before escalating.",
+        "At least three focused repair/finalization turns are available before declaring a fixable implementation/validation issue blocked.",
+        "Only unavoidable user validation/action, secrets/auth, package-legitimacy checks, destructive operations, or unapproved product/architecture decisions are escalated.",
+        "Changed files, validation commands/results, deferred issues, blockers, residual risks, exact manual validation steps, and the next safe user instruction are reported."
+      ],
+      evidence: ["changed-files", "commands-run", "validation-output", "residual-risks", "diff-summary"],
+      review: { agent: "reviewer", focus: "Plan adherence, validation failures, scope creep, and fixable issues before final response." },
+      stopRules: [
+        "Do not expand product scope beyond the saved plan.",
+        "Do not make unapproved product or architecture decisions.",
+        "Do not perform destructive operations or package-manager substitutions without user approval.",
+        "Stop only when human validation/action is inevitable or no independent slice can progress.",
+      ],
+      maxFinalizationTurns: GSD_MAX_AUTOFIX_ATTEMPTS,
+    };
+
     const chain: any[] = [];
     if (preflight.length) chain.push({ parallel: preflight, concurrency: Math.min(3, preflight.length) });
     chain.push({
@@ -842,11 +921,12 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
       phase: "Implementation",
       label: "Single writer implementation",
       as: "workerResult",
-      task: `[PROJECT FLOW: GSD SINGLE WRITER BUILD]\nPlan file: ${planRel}\n\nImplement only plan-approved changes. You are the sole writer for the active worktree. Use the relayed saved-plan evidence and any preflight summaries below to sequence work, but do not expand scope or make unapproved product/architecture decisions. If a blocker or unapproved decision is required, stop and report it. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Validate with focused checks. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.\n\n${relayedEvidence}`,
+      task: `[PROJECT FLOW: GSD SINGLE WRITER BUILD]\nPlan file: ${planRel}\n\n${gsdAutoRules}\n\nImplement only plan-approved changes. You are the sole writer for the active worktree. Use the relayed saved-plan evidence and any preflight summaries below to sequence work, but do not expand scope or make unapproved product/architecture decisions. If a blocker or unapproved decision is required and no independent plan-approved slice can progress, stop and report it. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Validate with focused checks. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.\n\n${relayedEvidence}`,
       reads: [planRel],
       output: "gsd/worker-result.md",
       outputMode: "file-only",
       progress: true,
+      acceptance: gsdAcceptance,
     });
     chain.push({
       parallel: [
@@ -854,7 +934,8 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
           agent: "reviewer",
           phase: "Validation",
           label: "Implementation validation",
-          task: `Validate the post-worker diff against the saved plan ${planRel}. Start from worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report blockers, fixes worth doing now, and validation gaps.`,
+          as: "implementationValidation",
+          task: `Validate the post-worker diff against the saved plan ${planRel}. Start from worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report blockers, fixes worth doing now, independent slices that can still progress, and validation gaps.`,
           reads: [planRel],
           output: "gsd/implementation-validation.md",
           outputMode: "file-only",
@@ -863,9 +944,45 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
           agent: "reviewer",
           phase: "Validation",
           label: "Scope and docs validation",
-          task: `Validate scope control, docs/memory needs, and regression risk after the worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report only evidence-backed issues with file references.`,
+          as: "scopeDocsValidation",
+          task: `Validate scope control, docs/memory needs, and regression risk after the worker result: {outputs.workerResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report only evidence-backed issues with file references, and distinguish must-fix-now from optional/deferred feedback.`,
           reads: [planRel],
           output: "gsd/scope-docs-validation.md",
+          outputMode: "file-only",
+        },
+      ],
+      concurrency: 2,
+    });
+    chain.push({
+      agent: "worker",
+      phase: "Autofix",
+      label: "Apply validation fixes and continue remaining slices",
+      as: "autofixResult",
+      task: `[PROJECT FLOW: GSD AUTOFIX AND CONTINUE]\nPlan file: ${planRel}\n\n${gsdAutoRules}\n\nRead the initial worker result and validation artifacts. Apply only must-fix-now issues that are inside the saved plan and directly caused by the implementation. If reviewers found no must-fix-now issues, verify that no independent plan-approved slice remains unattempted; otherwise continue those remaining slices. Do not stop just because an earlier slice closed. If a reported issue needs user validation/action or an unapproved decision, defer it with exact rationale and continue any independent safe slice.\n\nInitial worker result:\n{outputs.workerResult}\n\nImplementation validation:\n{outputs.implementationValidation}\n\nScope/docs validation:\n{outputs.scopeDocsValidation}`,
+      reads: [planRel],
+      output: "gsd/autofix-result.md",
+      outputMode: "file-only",
+      progress: true,
+      acceptance: gsdAcceptance,
+    });
+    chain.push({
+      parallel: [
+        {
+          agent: "reviewer",
+          phase: "Final validation",
+          label: "Final implementation validation",
+          task: `Validate the final diff against the saved plan ${planRel}. Start from worker results: {outputs.workerResult}\n\nAutofix result: {outputs.autofixResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report remaining blockers, whether they truly require user validation/action, any safe independent slices left unattempted, exact manual validation steps with expected results, and the next safe operator instruction.`,
+          reads: [planRel],
+          output: "gsd/final-implementation-validation.md",
+          outputMode: "file-only",
+        },
+        {
+          agent: "reviewer",
+          phase: "Final validation",
+          label: "Final scope and docs validation",
+          task: `Validate final scope control, docs/memory needs, and regression risk after autofix result: {outputs.autofixResult}. Do not modify project/source files; returning findings through the configured output artifact is allowed. Report only evidence-backed must-fix blockers, precise manual follow-ups, pending plan slices/milestones, and whether the user can safely continue GSD or must validate first.`,
+          reads: [planRel],
+          output: "gsd/final-scope-docs-validation.md",
           outputMode: "file-only",
         },
       ],
@@ -896,6 +1013,187 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     ctx.ui.notify("Project Flow GSD pipeline started via AgentAdapter.", "info");
     pi.sendMessage({ customType: "project-flow-agent-started", content: `# Project Flow GSD Pipeline Started\n\n${text}`, display: true }, { triggerTurn: false });
   }
+}
+
+function gsdEvidenceFiles(cwd: string, maxFiles = 24): string[] {
+  const dir = join(cwd, "gsd");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter(name => name.endsWith(".md"))
+    .sort()
+    .slice(0, maxFiles)
+    .map(name => relative(cwd, join(dir, name)));
+}
+
+function gsdPrintReport(cwd: string, planPath?: string): string {
+  const evidenceFiles = gsdEvidenceFiles(cwd, 40);
+  const planBody = planPath && existsSync(planPath) ? readFileSync(planPath, "utf8") : "No Project Flow plan found.";
+  const preferred = [
+    "gsd/resume-ledger.md",
+    "gsd/next-slice-plan.md",
+    "gsd/continue-result.md",
+    "gsd/continue-validation.md",
+    "gsd/continue-scope-validation.md",
+    "gsd/worker-result.md",
+    "gsd/post-gsd-fix-worker.md",
+    "gsd/full-spec-gsd-inventory.md",
+  ].filter(p => existsSync(join(cwd, p)));
+  const rest = evidenceFiles.filter(p => !preferred.includes(p));
+  const selected = [...preferred, ...rest].slice(0, 18);
+  const evidenceBlocks = selected.map(p => {
+    const body = readFileSync(join(cwd, p), "utf8");
+    return `## ${p}\n\n${body.slice(0, 6000)}${body.length > 6000 ? "\n\n[truncated]" : ""}`;
+  }).join("\n\n");
+  return [
+    "# Project Flow GSD Status Print",
+    "",
+    `Plan: ${planPath ? relative(cwd, planPath) : "none"}`,
+    "",
+    "## Full Saved Plan",
+    "",
+    planBody.slice(0, 30000) + (planBody.length > 30000 ? "\n\n[plan truncated]" : ""),
+    "",
+    "## GSD Evidence / Progress Files",
+    "",
+    evidenceFiles.length ? evidenceFiles.map(p => `- ${p}`).join("\n") : "No gsd/*.md files found.",
+    "",
+    evidenceBlocks || "No GSD evidence content found.",
+  ].join("\n");
+}
+
+async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPath: string, target: string): Promise<void> {
+  ensureProjectFlow(ctx.cwd);
+  state.phase = "build_requested";
+  state.planPath = planPath;
+  state.notes = [...(state.notes ?? []), `/gsd-continue requested${target ? `: ${target}` : ""}`];
+  saveState(ctx.cwd);
+  renderWidget(ctx);
+  setTools(pi, ["read", "bash", "subagent", "project_flow_finish", "project_flow_context", "project_flow_list_modules", "project_flow_read_headers", "project_flow_read_signatures", "project_flow_memory_search"]);
+
+  const planRel = rel(ctx.cwd, planPath);
+  const evidenceFiles = gsdEvidenceFiles(ctx.cwd);
+  const evidenceList = evidenceFiles.length ? evidenceFiles.map(p => `- ${p}`).join("\n") : "- No existing gsd/*.md evidence files found.";
+  const resumeTarget = target || "Continue from the first pending milestone/slice after reconciling existing evidence.";
+  const gsdRules = `GSD continue contract:\n- First reconcile the saved plan and existing GSD evidence; do not redo completed milestones/slices/tasks.\n- Write/update gsd/resume-ledger.md with completed, pending, blocked, manual-checkpoint, and continuation-plan items before implementation.\n- Plan the maximal safe dependency-ordered continuation chain before writing code: as many plan-approved atomic auto tasks as can run before human validation/action is absolutely necessary.\n- Do not stop for deferrable human verification; record human-check/UAT items for end-of-chain review unless later work truly depends on the human result.\n- Each implementation worker executes at most one atomic task, then hands off through gsd/continue-task-XX.md; later workers start fresh and continue from the ledger plus prior task summaries.\n- Auto-fix scoped implementation/validation issues up to ${GSD_MAX_AUTOFIX_ATTEMPTS} focused attempts before marking that task blocked and allowing later independent planned tasks to progress when safe.\n- Stop only for unavoidable user validation/action, secrets/auth, package-legitimacy checks, destructive operations, unapproved product/architecture decisions, or when no independent planned task can progress.\n- Final handoff must say whether the overall plan is complete, partial, or blocked; list completed and pending milestones/slices/tasks; list deferred human-check/UAT items and blocking manual checkpoints with steps/expected results; and give the next safe operator instruction.`;
+  const gsdAcceptance = {
+    criteria: [
+      "Existing GSD evidence is reconciled before implementation and completed work is not redone.",
+      "A completed/pending/blocked/manual checkpoint ledger plus maximal safe continuation plan is written or updated under gsd/resume-ledger.md.",
+      "The continuation plan records as many dependency-ordered plan-approved atomic auto tasks as can run before human validation/action is absolutely necessary.",
+      "Each implementation worker attempts at most one atomic task from the planned safe continuation chain, and later fresh workers continue from prior summaries.",
+      "Scoped fixable issues are auto-fixed within the configured attempt budget before escalation.",
+      "Final output includes exact validation evidence, remaining manual checks, and the next safe user instruction.",
+    ],
+    evidence: ["changed-files", "commands-run", "validation-output", "residual-risks", "diff-summary"],
+    review: { agent: "reviewer", focus: "Resume correctness: no duplicated completed work, plan adherence, validation, and operator-actionable next steps." },
+    stopRules: [
+      "Do not redo completed milestones/slices from existing evidence.",
+      "Do not expand product scope beyond the saved plan.",
+      "Do not make unapproved product or architecture decisions.",
+      "Stop only when human validation/action is inevitable before later planned work can safely proceed, or no planned auto task can progress.",
+    ],
+    maxFinalizationTurns: GSD_MAX_AUTOFIX_ATTEMPTS,
+  };
+
+  const chainSummary = [
+    "# Project Flow GSD Continue Chain",
+    "",
+    `Plan: ${planRel}`,
+    `Target: ${resumeTarget}`,
+    "",
+    "Existing evidence that will be read:",
+    evidenceList,
+    "",
+    "Steps that will run:",
+    "1. Continuation planning (scout): read the plan and existing gsd/*.md evidence; write gsd/resume-ledger.md with completed/pending/blocked/manual checkpoint status plus the maximal safe dependency-ordered atomic task chain.",
+    `2. Atomic task execution: run up to ${GSD_MAX_CONTINUE_TASKS} fresh worker steps, each executing at most one planned atomic task and writing gsd/continue-task-XX.md.`,
+    "3. Validation fanout (reviewers): verify no completed work was redone, workers followed the planned chain one atomic task at a time, validation evidence is sufficient, and deferred human checks/manual checkpoints/next steps are actionable.",
+    "",
+    "Stop conditions:",
+    "- unavoidable user validation/action before later planned work can safely proceed, secrets/auth, package-legitimacy checks, destructive operations, unapproved product/architecture decisions, or no planned auto task can progress."
+  ].join("\n");
+  pi.sendMessage({ customType: "project-flow-gsd-chain-preview", content: chainSummary, display: true }, { triggerTurn: false });
+
+  const atomicWorkerSteps = Array.from({ length: Math.max(1, GSD_MAX_CONTINUE_TASKS) }, (_, i) => {
+    const n = i + 1;
+    const as = `continueTask${n}`;
+    const priorOutputs = Array.from({ length: i }, (_v, j) => `## Prior atomic worker ${j + 1}\n{outputs.continueTask${j + 1}}`).join("\n\n") || "No prior atomic task workers in this /gsd-continue run.";
+    return {
+      agent: "worker",
+      phase: "Implementation",
+      label: `Atomic GSD task ${n}`,
+      as,
+      task: `[PROJECT FLOW: GSD ATOMIC TASK ${n}]\nPlan file: ${planRel}\nResume target: ${resumeTarget}\n\n${gsdRules}\n\nResume ledger and continuation plan:\n{outputs.resumeLedger}\n\nPrior atomic task results:\n${priorOutputs}\n\nExecute at most ONE next atomic auto task from the Maximal Safe Continuation Chain in gsd/resume-ledger.md. Start fresh: use the ledger and prior atomic task results to identify the first uncompleted planned task that is not blocked. Do not redo completed work. Do not execute two tasks in one worker, even if the next task is small. If no planned task remains, or all remaining tasks are blocked by prior results, write a no-op handoff saying the chain is complete or blocked and do not modify source files.\n\nDo not stop for deferrable human-check/UAT items; record them for end-of-chain review unless later work truly depends on the human result. Stop this task only at a true blocker: required user decision, auth/secret/manual action, package-legitimacy check, destructive operation, unapproved product/architecture decision, or human verification whose result is required before later work can safely proceed. If the current task is blocked but a later independent planned task can safely progress, skip the blocked task with exact rationale and execute that one independent task instead.\n\nValidate the task with focused checks before handoff. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.`,
+      reads: [planRel, ...evidenceFiles],
+      output: `gsd/continue-task-${String(n).padStart(2, "0")}.md`,
+      outputMode: "file-only",
+      progress: true,
+    };
+  });
+  const atomicTaskOutputRefs = atomicWorkerSteps.map((_step, i) => `## Atomic worker ${i + 1}\n{outputs.continueTask${i + 1}}`).join("\n\n");
+
+  const chain: any[] = [
+    {
+      agent: "scout",
+      phase: "Continuation planning",
+      label: "GSD resume ledger and continuation plan",
+      as: "resumeLedger",
+      task: `[PROJECT FLOW: GSD RESUME + CONTINUATION PLAN]\nPlan file: ${planRel}\nResume target: ${resumeTarget}\n\nExisting evidence files:\n${evidenceList}\n\nRead the saved plan and existing GSD evidence. Do not modify source files. Produce and write an operator-actionable gsd/resume-ledger.md that includes:\n1. completed milestones/slices/tasks with evidence,\n2. pending work,\n3. blocked/manual checkpoints with exact validation steps and expected results,\n4. deferred human-check/UAT items that do NOT block further automation, and\n5. a \"Maximal Safe Continuation Chain\" section.\n\nFor the continuation chain, plan as many dependency-ordered, plan-approved atomic auto tasks as can safely run before human validation/action is absolutely necessary. Prefer chaining dependent tasks sequentially over stopping early, but keep task boundaries atomic: one clear change, owned/shared files, validation, done condition, and handoff evidence. Only stop the chain at a true blocker: required user decision, auth/secret/manual action, package-legitimacy check, destructive operation, unapproved product/architecture decision, or human verification whose result is required before later work can safely proceed. If evidence is ambiguous, mark it uncertain rather than redoing work.`,
+      reads: [planRel, ...evidenceFiles],
+      output: "gsd/resume-ledger.md",
+      outputMode: "file-only",
+    },
+    ...atomicWorkerSteps,
+    {
+      parallel: [
+        {
+          agent: "reviewer",
+          phase: "Validation",
+          label: "Resume/implementation validation",
+          as: "continueValidation",
+          task: `Validate the resumed GSD work against ${planRel}. Start from resume ledger and continuation plan: {outputs.resumeLedger}\n\nAtomic worker results:\n${atomicTaskOutputRefs}. Do not modify project/source files. Verify completed work was not redone, each worker executed at most one planned atomic task, workers followed the planned maximal safe continuation chain, pending work is accurately marked, validation evidence is sufficient, and deferred human checks/blockers/manual checkpoints are exact and actionable.`,
+          reads: [planRel],
+          output: "gsd/continue-validation.md",
+          outputMode: "file-only",
+        },
+        {
+          agent: "reviewer",
+          phase: "Validation",
+          label: "Scope/manual checkpoint validation",
+          as: "continueScopeValidation",
+          task: `Validate scope control and manual checkpoint clarity after resumed GSD work. Start from resume ledger and continuation plan: {outputs.resumeLedger}\n\nAtomic worker results:\n${atomicTaskOutputRefs}. Do not modify project/source files. Report whether the continuation planning chained as much safe work as possible before true human validation/action, whether fresh workers respected atomic task boundaries, whether the user can safely run /gsd-continue again, must perform manual validation first, or the overall plan is complete.`,
+          reads: [planRel],
+          output: "gsd/continue-scope-validation.md",
+          outputMode: "file-only",
+        },
+      ],
+      concurrency: 2,
+    },
+  ];
+
+  const bridge = await requestSubagentBridge(pi, {
+    context: "fresh",
+    async: true,
+    agentScope: "both",
+    chain,
+  });
+
+  if (!bridge.ok) {
+    state.phase = "blocked";
+    state.notes = [...(state.notes ?? []), `AgentAdapter blocked /gsd-continue: ${bridge.error}`];
+    saveState(ctx.cwd);
+    renderWidget(ctx);
+    ctx.ui.notify(`Project Flow /gsd-continue blocked: ${bridge.error}`, "error");
+    pi.sendMessage({ customType: "project-flow-agent-blocked", content: agentFailureReport(ctx, planPath, bridge.error, bridge.requestId), display: true }, { triggerTurn: false });
+    return;
+  }
+
+  state.phase = "building";
+  saveState(ctx.cwd);
+  renderWidget(ctx);
+  const text = bridge.response?.result?.content?.find?.((c: any) => c.type === "text")?.text ?? "GSD continue pipeline started.";
+  ctx.ui.notify("Project Flow /gsd-continue pipeline started.", "info");
+  pi.sendMessage({ customType: "project-flow-agent-started", content: `# Project Flow GSD Continue Started\n\nPlan: ${planRel}\nTarget: ${resumeTarget}\n\n${text}`, display: true }, { triggerTurn: false });
 }
 
 export default function projectFlow(pi: ExtensionAPI): void {
@@ -1267,7 +1565,7 @@ export default function projectFlow(pi: ExtensionAPI): void {
       }
       if (grillRounds.length && !params.grillResolutionSummary?.trim()) {
         return {
-          content: [{ type: "text", text: `Project Flow plan not saved yet. ${grillRounds.length} grill round(s) have answers, but grillResolutionSummary was omitted. Reconsider those answers now, revise the plan, ask another project_flow_grill_question if a new blocker appears, then call project_flow_save_plan again with blockerAnalysisSummary and grillResolutionSummary.\n\n${sessionNotesContext(ctx.cwd)}` }],
+          content: [{ type: "text", text: `Project Flow plan not saved yet. grillResolutionSummary was omitted after ${grillRounds.length} answered grill round(s). Re-sweep the potential plan with the captured answers, then call project_flow_save_plan with a grillResolutionSummary that explains how every grill answer changed or confirmed the plan.\n\n${sessionNotesContext(ctx.cwd)}` }],
           isError: true,
           details: { reason: "missing_grill_resolution_summary", grillRoundCount: grillRounds.length },
         };
@@ -1276,9 +1574,9 @@ export default function projectFlow(pi: ExtensionAPI): void {
         const missingRefs = grillResolutionMissingRefs(params.grillResolutionSummary);
         if (missingRefs.length) {
           return {
-            content: [{ type: "text", text: `Project Flow plan not saved yet. grillResolutionSummary does not appear to reference every answered grill question. Mention each grill round by number or by its concrete decision, then save again.\n\nMissing apparent references:\n${missingRefs.map(q => `- ${q}`).join("\n")}\n\n${sessionNotesContext(ctx.cwd)}` }],
+            content: [{ type: "text", text: `Project Flow plan not saved yet. grillResolutionSummary does not appear to reference every answered grill question. Missing apparent references: ${missingRefs.join("; ")}\n\nRevise the potential plan with all grill answers, re-sweep blockers, and summarize how each answer was incorporated.\n\n${sessionNotesContext(ctx.cwd)}` }],
             isError: true,
-            details: { reason: "incomplete_grill_resolution_summary", grillRoundCount: grillRounds.length, missingRefs },
+            details: { reason: "incomplete_grill_resolution_summary", missingRefs },
           };
         }
       }
@@ -1295,7 +1593,11 @@ export default function projectFlow(pi: ExtensionAPI): void {
         };
       }
       const blockerBlock = `\n\n## Blocker Analysis\n\n${params.blockerAnalysisSummary.trim()}\n`;
-      const grillBlock = params.grillResolutionSummary?.trim() ? `\n\n## Grill Resolution\n\n${params.grillResolutionSummary.trim()}\n` : "";
+      const grillSummary = params.grillResolutionSummary?.trim();
+      const grillLog = grillAnswerLog();
+      const grillBlock = grillSummary || grillLog
+        ? `\n\n## Grill Resolution\n\n${grillSummary || "See the persisted Grill Answer Log below."}\n${grillLog ? `\n\n${grillLog}\n` : ""}`
+        : "";
       const questionsBlock = hasUnresolved ? `\n\n## Blocking Questions\n\n${params.unresolvedQuestions!.map((q: string, i: number) => `${i + 1}. ${q}`).join("\n")}\n` : "";
       const frontmatter = params.markdown.trimStart().startsWith("---")
         ? ""
@@ -1544,6 +1846,84 @@ export default function projectFlow(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("gsd-continue", {
+    description: "Resume/continue the GSD subagent pipeline from the active or latest Project Flow plan without redoing completed evidence",
+    handler: async (args, ctx) => {
+      ensureProjectFlow(ctx.cwd);
+      const loaded = latestSession(ctx.cwd);
+      if (loaded) state = loaded;
+      const raw = args.trim();
+      const first = raw.split(/\s+/)[0] || "";
+      const candidatePath = first ? (first.startsWith("/") ? first : join(ctx.cwd, first)) : "";
+      const planPath = candidatePath && existsSync(candidatePath)
+        ? candidatePath
+        : state.planPath || latestFile(ctx.cwd, PLANS_DIR, ".md");
+      if (!planPath || !existsSync(planPath)) {
+        ctx.ui.notify("No Project Flow plan found for /gsd-continue. Run /plan first or pass a plan path.", "warning");
+        pi.sendMessage({ customType: "project-flow-gsd-continue", content: "# Project Flow GSD Continue\n\nNo saved Project Flow plan was found. Run `/plan <task>` first, or pass a plan path: `/gsd-continue .pi/project-flow/plans/<plan>.md`.", display: true }, { triggerTurn: false });
+        return;
+      }
+      const target = candidatePath && existsSync(candidatePath) ? raw.slice(first.length).trim() : raw;
+      await launchGsdContinue(pi, ctx, planPath, target);
+    },
+  });
+
+  pi.registerCommand("gsd", {
+    description: "Alias for /gsd-continue",
+    handler: async (args, ctx) => {
+      ensureProjectFlow(ctx.cwd);
+      const loaded = latestSession(ctx.cwd);
+      if (loaded) state = loaded;
+      const raw = args.trim();
+      const first = raw.split(/\s+/)[0] || "";
+      const candidatePath = first ? (first.startsWith("/") ? first : join(ctx.cwd, first)) : "";
+      const planPath = candidatePath && existsSync(candidatePath)
+        ? candidatePath
+        : state.planPath || latestFile(ctx.cwd, PLANS_DIR, ".md");
+      if (!planPath || !existsSync(planPath)) {
+        ctx.ui.notify("No Project Flow plan found for /gsd. Run /plan first or pass a plan path.", "warning");
+        pi.sendMessage({ customType: "project-flow-gsd-continue", content: "# Project Flow GSD\n\nNo saved Project Flow plan was found. Run `/plan <task>` first, or pass a plan path: `/gsd .pi/project-flow/plans/<plan>.md`.", display: true }, { triggerTurn: false });
+        return;
+      }
+      const target = candidatePath && existsSync(candidatePath) ? raw.slice(first.length).trim() : raw;
+      await launchGsdContinue(pi, ctx, planPath, target);
+    },
+  });
+
+  pi.registerCommand("gsd-print", {
+    description: "Print current GSD progress/evidence and the rest of the saved Project Flow plan without launching workers",
+    handler: async (args, ctx) => {
+      ensureProjectFlow(ctx.cwd);
+      const loaded = latestSession(ctx.cwd);
+      if (loaded) state = loaded;
+      const raw = args.trim();
+      const candidatePath = raw ? (raw.startsWith("/") ? raw : join(ctx.cwd, raw)) : "";
+      const planPath = candidatePath && existsSync(candidatePath)
+        ? candidatePath
+        : state.planPath || latestFile(ctx.cwd, PLANS_DIR, ".md");
+      const report = gsdPrintReport(ctx.cwd, planPath);
+      pi.sendMessage({ customType: "project-flow-gsd-print", content: report, display: true }, { triggerTurn: false });
+      ctx.ui.notify("Project Flow GSD status printed; no workers launched.", "info");
+    },
+  });
+
+  pi.registerCommand("gsd-print-status", {
+    description: "Alias for /gsd-print",
+    handler: async (args, ctx) => {
+      ensureProjectFlow(ctx.cwd);
+      const loaded = latestSession(ctx.cwd);
+      if (loaded) state = loaded;
+      const raw = args.trim();
+      const candidatePath = raw ? (raw.startsWith("/") ? raw : join(ctx.cwd, raw)) : "";
+      const planPath = candidatePath && existsSync(candidatePath)
+        ? candidatePath
+        : state.planPath || latestFile(ctx.cwd, PLANS_DIR, ".md");
+      const report = gsdPrintReport(ctx.cwd, planPath);
+      pi.sendMessage({ customType: "project-flow-gsd-print", content: report, display: true }, { triggerTurn: false });
+      ctx.ui.notify("Project Flow GSD status printed; no workers launched.", "info");
+    },
+  });
+
   pi.registerCommand("doc", {
     description: "Run Project Flow documentation/memory reconciliation",
     handler: async (_args, ctx) => {
@@ -1579,9 +1959,15 @@ export default function projectFlow(pi: ExtensionAPI): void {
     }
     if (event.toolName === "bash") {
       const command = typeof (event as any).input?.command === "string" ? (event as any).input.command : "";
+      const planningReason = planningCommandReason(command);
+      if (planningReason) return { block: true, reason: planningReason };
       if (!isSafeReadOnlyBash(command)) {
         return { block: true, reason: "Project Flow planning permits only read-only shell inspection before build approval." };
       }
+    }
+    if (event.toolName === "subagent") {
+      const reason = planningSubagentReason((event as any).input);
+      if (reason) return { block: true, reason };
     }
   });
 }

@@ -19,6 +19,15 @@ Slices may run in parallel only when:
 - failure attribution remains clear;
 - validation can run per slice or after a known milestone.
 
+## GSD Atomicity
+
+GSD scheduling prefers many small fresh-worker tasks over oversized sessions:
+
+- split large slices until each worker has one clear change, owned files, done condition, and validation evidence;
+- continue scheduling as many dependency-ordered plan-approved auto tasks as are safe before human validation/action is truly required;
+- default continuation cap is 15 worker tasks per `/gsd-continue` run, configurable lower/higher by environment but clamped by implementation safety;
+- human verification that does not block later automation is recorded as deferred/manual evidence, not used to stop early.
+
 ## Output
 
 Scheduler proposes:

@@ -90,6 +90,11 @@ record('grill queue state is deterministic', /blockerQueue/.test(ext) && /curren
 record('grill merge guard is present', /grillMergeWarning/.test(ext) && /independent ambiguities/.test(ext));
 record('grill answers are persisted and surfaced on continue', /grillRounds/.test(ext) && /sessionNotesContext/.test(ext) && /Grill Rounds Answered/.test(ext));
 record('planning prompts are function-built', /function planningPrompt/.test(ext) && /function continuePrompt/.test(ext) && /projectFlowPlanningRules/.test(ext));
+record('planning mode blocks validation/test execution', /planningCommandReason/.test(ext) && /Planning mode is planning only/.test(ext) && /must not run test\/build\/validation commands/.test(ext));
+record('planning subagents are read-only only', /planningSubagentReason/.test(ext) && /worker\/validator execution/.test(ext));
+record('GSD continue default cap is 15 atomic workers', /PI_PROJECT_FLOW_GSD_MAX_CONTINUE_TASKS \|\| "15"/.test(ext) && /Math\.min\(15/.test(ext));
+record('initial GSD build uses atomic continue chain', /Build with GSD subagent pipeline[\s\S]*launchGsdContinue\(pi, ctx, planPath/.test(ext));
+record('plan prompt requires fresh-worker-sized tasks', /small enough for fresh worker sessions/.test(ext) && /break it down further before saving the plan/.test(ext));
 record('plan save rejects omitted blocker analysis', /missing_blocker_analysis_summary/.test(ext));
 record('plan save rejects omitted grill resolution summary', /missing_grill_resolution_summary/.test(ext));
 record('plan save rejects incomplete grill summaries', /incomplete_grill_resolution_summary/.test(ext) && /grillResolutionMissingRefs/.test(ext));

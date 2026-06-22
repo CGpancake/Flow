@@ -39,19 +39,40 @@ No unresolved blocking questions.
 
 - Decision, rejected alternatives, why, failure mode prevented.
 
-## Slices
+## GSD Work Breakdown
 
-### Slice 1: Name
+Each slice should be independently verifiable and small enough for one focused worker pass. Split further if it touches unrelated files, mixes unrelated behavior, cannot be validated independently, or would require more than one architectural decision.
+
+### Milestone 1: Name
 
 - Goal:
+- Acceptance:
+- Dependencies:
+- Validation checkpoint:
+
+#### Slice 1.1: Name
+
+- Goal:
+- User-visible outcome:
 - Owned files:
 - Shared files:
-- Dependencies:
+- Dependencies / must follow:
 - Parallel safe with:
-- Steps:
+- Not parallel safe with / conflict reason:
+- Stop / escalation triggers:
 - Automatic validation:
 - Manual validation:
 - Evidence required:
+
+##### Tasks
+
+1. Task name
+   - Type: auto | human-verify | decision | human-action
+   - Files:
+   - Change:
+   - Done when:
+   - Validation:
+   - Auto-fix policy: fix scoped bugs/blockers up to 3 attempts; defer and continue independent tasks when possible.
 
 ## Validation Plan
 

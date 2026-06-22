@@ -35,5 +35,6 @@ Each captured answer is persisted with the session and must be surfaced on resum
 - After the current grill cycle is answered, require the planner to plug the collected answers back into the potential plan and re-sweep blockers before saving a plan.
 - If that re-sweep exposes new blockers, start another grill cycle with the next concise blocker question.
 - Require a blocker-analysis summary in saved plans, and a grill-resolution summary after any grill answer.
-- Prefer assumptions for reversible details.
+- Prefer assumptions only for reversible details.
+- Do not bury product intent, acceptance criteria, irreversible tradeoffs, destructive actions, dependency/framework choices, or locally impossible validation as silent assumptions; ask them through the grill queue.
 - Ask the user for product intent, irreversible tradeoffs, destructive actions, or locally impossible validation.

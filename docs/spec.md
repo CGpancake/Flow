@@ -148,6 +148,19 @@ Build starts only from post-plan choices:
 - build now in this session;
 - compact handoff / build after compact;
 - build in fresh subagent worker;
+- build with GSD subagent pipeline;
 - cancel / mark blocked.
+
+### GSD auto pipeline contract
+
+`/gsd-continue [plan path] [target]` and its alias `/gsd [plan path] [target]` resume the active/latest Project Flow plan through the GSD subagent pipeline. They must reconcile existing `gsd/*.md` evidence first, write/update `gsd/resume-ledger.md`, avoid redoing completed milestones/slices, and continue only pending plan-approved work.
+
+The GSD pipeline is automation-first, not slice-stop-first:
+
+- continue through all plan-approved independent slices that can safely progress;
+- auto-fix current-work bugs, missing critical correctness/security/validation, broken imports/types/config, and other blockers directly caused by implementation;
+- allow at least three focused repair/finalization attempts before declaring a fixable issue blocked;
+- defer a local issue and move to the next independent slice when the attempt budget is exhausted and progress is still possible;
+- stop only for unavoidable user validation/action, secrets/auth, package-legitimacy checks, destructive operations, unapproved product/architecture decisions, or when no independent slice can progress.
 
 Existing-context build en
