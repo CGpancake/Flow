@@ -107,6 +107,8 @@ const PF_REVIEW_MODEL = FLOW_ENV.PI_PROJECT_FLOW_REVIEW_MODEL || FLOW_ENV.PI_PRO
 const MAX_SAFE_CARGO_JOBS = Number(FLOW_ENV.PI_PROJECT_FLOW_MAX_CARGO_JOBS || "2");
 const GSD_MAX_AUTOFIX_ATTEMPTS = Number(FLOW_ENV.PI_PROJECT_FLOW_GSD_MAX_AUTOFIX_ATTEMPTS || "3");
 const GSD_MAX_CONTINUE_TASKS = Math.min(15, Math.max(1, Number(FLOW_ENV.PI_PROJECT_FLOW_GSD_MAX_CONTINUE_TASKS || "15")));
+const GSD_DEFAULT_CONTINUE_TASKS = Math.min(GSD_MAX_CONTINUE_TASKS, Math.max(1, Number(FLOW_ENV.PI_PROJECT_FLOW_GSD_DEFAULT_BATCH_TASKS || "15")));
+const PONYTAIL_SKILL_NAME = "ponytail";
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const EXTENSION_REPO_ROOT = normalizePath(join(EXTENSION_DIR, "..", "..", ".."));
 const SOURCE_FLOW_ROOT = DEV_FLOW_ROOT || REPO_FLOW_ROOT || EXTENSION_REPO_ROOT;
@@ -149,6 +151,388 @@ function devFlowRoot(ctx: ExtensionContext): string {
 
 function safeSlug(input: string): string {
   return input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 72) || "project-flow-plan";
+}
+
+type GsdBaseAgent = "scout" | "worker" | "reviewer";
+
+type GsdDisplayIdentity = {
+  baseAgent: GsdBaseAgent;
+  workerName: string;
+  taskTitle: string;
+  slug: string;
+  displayName: string;
+  displayAgent: string;
+};
+
+const GSD_WORKER_NAMES = [
+  "Regex Necromancer", "Merge Oracle", "YAML Sommelier", "Cache Goblin", "Lint Gremlin", "Schema Whisperer", "Commit Alchemist", "Diff Cartographer",
+  "Build Janitor", "Token Accountant", "Prompt Mechanic", "Stack Archaeologist", "Bug Sommelier", "Flake Exorcist", "Config Surgeon", "Dependency Diplomat",
+  "Branch Librarian", "Race Detective", "Patch Barber", "Scope Bouncer", "Null Wrangler", "Import Chiropractor", "Docker Florist", "Queue Therapist",
+  "Review Goblin", "Format Wizard", "Release Cartographer", "Deadline Juggler", "Backlog Gardener", "Migration Plumber", "Context Tailor", "Protocol Dentist",
+  "Workflow Locksmith", "Artifact Curator", "Rollback Prophet", "Fixture Blacksmith", "Mock Naturalist", "Pipeline Barber", "Semaphore Mystic", "Runtime Notary",
+];
+const GSD_TITLE_FILLER = ["Task", "Work", "Review"];
+const GSD_BASE_AGENT_PROFILES: Record<GsdBaseAgent, { description: string; thinking: "low" | "medium" | "high"; tools: string; extraFrontmatter?: string; rolePrompt: string }> = {
+  scout: {
+    description: "Project Flow GSD display alias for continuation planning",
+    thinking: "low",
+    tools: "read, grep, find, ls, bash, write, intercom",
+    extraFrontmatter: "output: context.md\ndefaultProgress: true",
+    rolePrompt: "You are a scouting subagent running inside pi. Move fast, verify from local evidence, and return compressed context/planning output for handoff. Use the task prompt as the source of truth.",
+  },
+  worker: {
+    description: "Project Flow GSD display alias for atomic implementation work",
+    thinking: "medium",
+    tools: "read, grep, find, ls, bash, edit, write, contact_supervisor",
+    extraFrontmatter: "defaultContext: fresh\nskills: ponytail\ndefaultProgress: true",
+    rolePrompt: "You are `worker`: the implementation subagent and single writer thread. Execute only the assigned atomic task with narrow, coherent edits. Use only the task packet, explicit reads, and handoff outputs unless you must inspect owned files. Pause for unapproved decisions instead of guessing.",
+  },
+  reviewer: {
+    description: "Project Flow GSD display alias for validation review",
+    thinking: "high",
+    tools: "read, grep, find, ls, bash, edit, write, intercom",
+    extraFrontmatter: "defaultReads: plan.md, progress.md\ndefaultProgress: true",
+    rolePrompt: "You are a disciplined review subagent. Inspect, evaluate, and report evidence-backed findings. Do not invent issues; cite files, commands, and exact blockers.",
+  },
+};
+
+function titleSlug(input: string): string {
+  return safeSlug(input) || "gsd-task";
+}
+
+function titleCaseWord(word: string): string {
+  if (/^\d+$/.test(word)) return word;
+  return word.slice(0, 1).toUpperCase() + word.slice(1).toLowerCase();
+}
+
+function sanitizeGsdTaskTitle(input: string): string {
+  const words = input.match(/[A-Za-z0-9]+/g)?.map(titleCaseWord) ?? [];
+  const normalized = [...words, ...GSD_TITLE_FILLER].slice(0, 3);
+  return normalized.join(" ");
+}
+
+function randomFrom<T>(values: readonly T[]): T {
+  return values[Math.floor(Math.random() * values.length)]!;
+}
+
+function randomWorkerName(): string {
+  return randomFrom(GSD_WORKER_NAMES);
+}
+
+function uniqueGsdSlug(baseSlug: string, usedSlugs: Set<string>): string {
+  const root = baseSlug || "gsd-worker";
+  let slug = root;
+  let i = 2;
+  while (usedSlugs.has(slug)) slug = `${root}-${i++}`;
+  usedSlugs.add(slug);
+  return slug;
+}
+
+function makeGsdDisplayIdentity(title: string, baseAgent: GsdBaseAgent, usedSlugs: Set<string>): GsdDisplayIdentity {
+  const workerName = randomWorkerName();
+  const taskTitle = sanitizeGsdTaskTitle(title);
+  const slug = uniqueGsdSlug(`${safeSlug(workerName)}-${titleSlug(taskTitle)}`, usedSlugs);
+  const displayName = `${workerName} — ${taskTitle}`;
+  return {
+    baseAgent,
+    workerName,
+    taskTitle,
+    slug,
+    displayName,
+    displayAgent: `${displayName} (${baseAgent})`,
+  };
+}
+
+function gsdIdentityPrompt(identity: GsdDisplayIdentity): string {
+  return [
+    `Worker: ${identity.workerName}`,
+    `Task title: ${identity.taskTitle}`,
+    `Display agent: ${identity.displayAgent}`,
+    `Stable slug: ${identity.slug}`,
+    "",
+    "Begin your output artifact with this identity header so the parent can map the TUI row to the output file:",
+    `# ${identity.taskTitle}`,
+    `Worker: ${identity.workerName}`,
+    `Task title: ${identity.taskTitle}`,
+    `Stable slug: ${identity.slug}`,
+  ].join("\n");
+}
+
+function gsdDisplayAgentDefinition(identity: GsdDisplayIdentity): string {
+  const profile = GSD_BASE_AGENT_PROFILES[identity.baseAgent];
+  return [
+    "---",
+    `name: ${identity.displayAgent}`,
+    `description: ${profile.description}: ${identity.displayName}`,
+    `tools: ${profile.tools}`,
+    `thinking: ${profile.thinking}`,
+    "systemPromptMode: replace",
+    "inheritProjectContext: true",
+    "inheritSkills: false",
+    profile.extraFrontmatter,
+    "---",
+    "",
+    `You are the Project Flow GSD display alias for the built-in \`${identity.baseAgent}\` role.`,
+    "",
+    "Visible identity:",
+    `- Worker: ${identity.workerName}`,
+    `- Task title: ${identity.taskTitle}`,
+    `- Stable slug: ${identity.slug}`,
+    "",
+    profile.rolePrompt,
+    "",
+    "Follow the task prompt exactly, keep scope tight, and preserve the identity header in file-only outputs.",
+    "",
+  ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function ensureProjectFlowDisplayAgentAlias(cwd: string, identity: GsdDisplayIdentity): string {
+  const aliasDir = join(cwd, ".pi", "agents", "project-flow-gsd");
+  const aliasPath = join(aliasDir, `${identity.slug}.md`);
+  writeAtomic(aliasPath, gsdDisplayAgentDefinition(identity));
+  return relative(cwd, aliasPath);
+}
+
+function ensureGsdDisplayAgentAlias(cwd: string, identity: GsdDisplayIdentity): string {
+  return ensureProjectFlowDisplayAgentAlias(cwd, identity);
+}
+
+type PonytailStatus = {
+  installed: boolean;
+  skillAvailable: boolean;
+  packageAvailable: boolean;
+  sources: string[];
+  message: string;
+};
+
+function readJsonBestEffort(path: string): any | undefined {
+  try { return JSON.parse(readFileSync(path, "utf8")); } catch { return undefined; }
+}
+
+function packageRootsInNodeModules(root: string): string[] {
+  if (!existsSync(root)) return [];
+  const roots: string[] = [];
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return []; }
+  for (const entry of entries) {
+    if (entry.name.startsWith(".")) continue;
+    const entryPath = join(root, entry.name);
+    if (entry.name.startsWith("@") && entry.isDirectory()) {
+      let scopedEntries;
+      try { scopedEntries = readdirSync(entryPath, { withFileTypes: true }); } catch { continue; }
+      for (const scoped of scopedEntries) {
+        if (!scoped.name.startsWith(".") && (scoped.isDirectory() || scoped.isSymbolicLink())) roots.push(join(entryPath, scoped.name));
+      }
+      continue;
+    }
+    if (entry.isDirectory() || entry.isSymbolicLink()) roots.push(entryPath);
+  }
+  return roots;
+}
+
+function skillPathHasPonytail(skillPath: string): boolean {
+  if (!existsSync(skillPath)) return false;
+  const baseName = safeSlug(skillPath.split(/[\\/]/).pop() || "");
+  if (baseName === PONYTAIL_SKILL_NAME && existsSync(join(skillPath, "SKILL.md"))) return true;
+  if (skillPath.toLowerCase().endsWith(`${PONYTAIL_SKILL_NAME}.md`)) return true;
+  let entries;
+  try { entries = readdirSync(skillPath, { withFileTypes: true }); } catch { return false; }
+  return entries.some(entry => {
+    if (entry.name.toLowerCase() === `${PONYTAIL_SKILL_NAME}.md`) return true;
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) return false;
+    return safeSlug(entry.name) === PONYTAIL_SKILL_NAME && existsSync(join(skillPath, entry.name, "SKILL.md"));
+  });
+}
+
+function detectPonytailStatus(cwd: string): PonytailStatus {
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  const sources: string[] = [];
+  const skillCandidates = [
+    join(cwd, ".pi", "skills", PONYTAIL_SKILL_NAME, "SKILL.md"),
+    join(cwd, ".pi", "skills", `${PONYTAIL_SKILL_NAME}.md`),
+    join(cwd, ".agents", "skills", PONYTAIL_SKILL_NAME, "SKILL.md"),
+    join(agentDir, "skills", PONYTAIL_SKILL_NAME, "SKILL.md"),
+    join(agentDir, "skills", `${PONYTAIL_SKILL_NAME}.md`),
+    join(homedir(), ".agents", "skills", PONYTAIL_SKILL_NAME, "SKILL.md"),
+  ];
+  for (const candidate of skillCandidates) {
+    if (existsSync(candidate)) sources.push(`skill:${candidate}`);
+  }
+
+  let packageAvailable = false;
+  const packageRoots = [
+    ...packageRootsInNodeModules(join(cwd, ".pi", "npm", "node_modules")),
+    ...packageRootsInNodeModules(join(agentDir, "npm", "node_modules")),
+  ];
+  for (const packageRoot of packageRoots) {
+    const pkg = readJsonBestEffort(join(packageRoot, "package.json"));
+    if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) continue;
+    const name = typeof pkg.name === "string" ? pkg.name : "";
+    const pi = pkg.pi && typeof pkg.pi === "object" && !Array.isArray(pkg.pi) ? pkg.pi : undefined;
+    const piSkills = Array.isArray(pi?.skills) ? pi.skills.filter((s: unknown): s is string => typeof s === "string") : [];
+    const piExtensions = Array.isArray(pi?.extensions) ? pi.extensions.filter((s: unknown): s is string => typeof s === "string") : [];
+    const looksLikePonytail = name.toLowerCase().includes(PONYTAIL_SKILL_NAME)
+      || [...piSkills, ...piExtensions].some((entry: string) => entry.toLowerCase().includes(PONYTAIL_SKILL_NAME));
+    if (!looksLikePonytail) continue;
+    packageAvailable = true;
+    sources.push(`package:${packageRoot}`);
+    for (const skillEntry of piSkills) {
+      const skillPath = join(packageRoot, skillEntry);
+      if (skillPathHasPonytail(skillPath)) sources.push(`package-skills:${skillPath}`);
+    }
+  }
+
+  const skillAvailable = sources.some(source => source.startsWith("skill:") || source.startsWith("package-skills:"));
+  const installed = skillAvailable || packageAvailable;
+  return {
+    installed,
+    skillAvailable,
+    packageAvailable,
+    sources,
+    message: installed
+      ? `Ponytail detected (${sources.join(", ")}); Project Flow will request skill '${PONYTAIL_SKILL_NAME}' when skill metadata is available and will not disable package extension hooks.`
+      : `Ponytail not detected in local Pi skill/package paths; Project Flow will not request a missing skill. Install with 'pi install git:github.com/DietrichGebert/ponytail' before expecting package-backed Ponytail behavior.`,
+  };
+}
+
+function ponytailSkillParam(status: PonytailStatus): Record<string, unknown> {
+  return status.skillAvailable ? { skill: PONYTAIL_SKILL_NAME } : {};
+}
+
+function ponytailPromptNote(status: PonytailStatus): string {
+  return `Ponytail worker-behavior integration: ${status.message}`;
+}
+
+function ponytailPreviewLines(status: PonytailStatus): string[] {
+  return [
+    "Ponytail worker-behavior integration:",
+    `- Installed locally: ${status.installed ? "yes" : "no"}`,
+    `- Skill request: ${status.skillAvailable ? PONYTAIL_SKILL_NAME : "not requested because the skill/package is not installed"}`,
+    `- Package sources: ${status.sources.length ? status.sources.join(", ") : "none detected"}`,
+  ];
+}
+
+type GsdWorkerBudget = {
+  hardCap: number;
+  defaultBatch: number;
+  explicitRequestedWorkerCount?: number;
+  pendingAutoTaskEstimate?: number;
+  workerBudget: number;
+  rationale: string;
+};
+
+function parseSmallCount(raw: string): number | undefined {
+  const normalized = raw.trim().toLowerCase();
+  if (/^\d+$/.test(normalized)) return Number(normalized);
+  const words: Record<string, number> = {
+    one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+    eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20,
+  };
+  return words[normalized];
+}
+
+function detectExplicitGsdWorkerCount(text: string): number | undefined {
+  const count = "(\\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)";
+  const patterns = [
+    new RegExp(`\\bexactly\\s+${count}\\s+(?:independent\\s+)?(?:workers?|subagents?|agents?)\\b`, "i"),
+    new RegExp(`\\b(?:worker|subagent|agent)\\s+count\\s*:\\s*(?:exactly\\s*)?${count}\\b`, "i"),
+    new RegExp(`\\b(?:selected\\s+)?(?:atomic\\s+)?(?:worker\\s+)?(?:budget|cap|batch|limit)\\s*(?::|=|to)?\\s*(?:exactly\\s*)?${count}\\b`, "i"),
+    new RegExp(`\\b(?:delegate|launch|start|run|fan[- ]?out)\\s+(?:to\\s+)?(?:exactly\\s+)?${count}\\s+(?:independent\\s+)?(?:workers?|subagents?|agents?)\\b`, "i"),
+    new RegExp(`\\b${count}[- ](?:worker|subagent|agent)\\b`, "i"),
+    new RegExp(`\\b${count}\\s+(?:independent\\s+)?(?:workers?|subagents?|agents?)\\b`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const value = match.slice(1).find(Boolean);
+    const parsed = value ? parseSmallCount(value) : undefined;
+    if (parsed !== undefined && Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return undefined;
+}
+
+function evidenceIndicatesGsdIncomplete(evidenceText: string): boolean {
+  return /\b(overall plan is not complete|plan is not complete|first pending|remains? pending|pending work|next plan-approved work remains|slice \d+ remains pending)\b/i.test(evidenceText);
+}
+
+function evidenceIndicatesGsdComplete(evidenceText: string): boolean {
+  if (evidenceIndicatesGsdIncomplete(evidenceText)) return false;
+  return /\b(no pending auto(?:mated)? (?:work|tasks)|no planned auto task remains|chain is complete|overall plan is complete|status:\s*(?:complete|pass))\b/i.test(evidenceText);
+}
+
+function estimatePendingGsdAutoTasks(planText: string, evidenceText: string): number | undefined {
+  if (evidenceText && evidenceIndicatesGsdComplete(evidenceText)) return 0;
+  const beforeHardBlocker = planText.split(/^\s*(?:###\s+)?(?:.*(?:human-verify|manual checkpoint|decision blocker|required user decision).*)$/im)[0] ?? planText;
+  const typeAutoCount = (beforeHardBlocker.match(/^\s*-?\s*Type:\s*`?auto`?\b/gim) || []).length;
+  const uncheckedCount = (beforeHardBlocker.match(/^\s*[-*]\s+\[ \]\s+/gm) || []).length;
+  const pendingCount = (beforeHardBlocker.match(/\b(?:pending|todo|remaining)\b[^\n]*(?:auto|task|slice)/gi) || []).length;
+  const rawEstimate = Math.max(typeAutoCount, uncheckedCount, pendingCount);
+  if (rawEstimate === 0) return undefined;
+  const completedContinueTasks = (evidenceText.match(/^##?\s+.*(?:Status:\s*)?(?:complete|completed|pass|satisfied)\b/gim) || []).length;
+  const completedFiles = (evidenceText.match(/^##\s+gsd\/continue-task-\d+\.md/gm) || []).length;
+  const completedEstimate = Math.max(completedContinueTasks, completedFiles);
+  return Math.max(0, rawEstimate - completedEstimate);
+}
+
+function computeGsdWorkerBudget(planText: string, targetText: string, evidenceText: string): GsdWorkerBudget {
+  const explicitRequestedWorkerCount = detectExplicitGsdWorkerCount(`${targetText}\n\n${planText}`);
+  const pendingAutoTaskEstimate = estimatePendingGsdAutoTasks(planText, evidenceText);
+  let selected: number;
+  let rationale: string;
+  if (explicitRequestedWorkerCount !== undefined) {
+    selected = explicitRequestedWorkerCount;
+    rationale = `explicit worker count detected: ${explicitRequestedWorkerCount}`;
+  } else if (pendingAutoTaskEstimate !== undefined && !(pendingAutoTaskEstimate === 0 && evidenceIndicatesGsdIncomplete(evidenceText))) {
+    selected = pendingAutoTaskEstimate;
+    rationale = `pending auto task estimate: ${pendingAutoTaskEstimate}`;
+  } else {
+    selected = GSD_DEFAULT_CONTINUE_TASKS;
+    rationale = `no explicit count or reliable pending-task estimate; using default batch ${GSD_DEFAULT_CONTINUE_TASKS}`;
+  }
+  const workerBudget = Math.min(GSD_MAX_CONTINUE_TASKS, Math.max(0, selected));
+  if (workerBudget !== selected) rationale = `${rationale}; clamped to hard cap ${GSD_MAX_CONTINUE_TASKS}`;
+  return { hardCap: GSD_MAX_CONTINUE_TASKS, defaultBatch: GSD_DEFAULT_CONTINUE_TASKS, explicitRequestedWorkerCount, pendingAutoTaskEstimate, workerBudget, rationale };
+}
+
+function stripMarkdownInline(input: string): string {
+  return input
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .trim();
+}
+
+function extractGsdAtomicTaskTitles(planText: string, maxCount: number): string[] {
+  if (maxCount <= 0) return [];
+  const titles: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string | undefined) => {
+    if (!raw) return;
+    let title = stripMarkdownInline(raw)
+      .replace(/^Atomic task\s+[A-Z0-9]+\s*[—:-]\s*/i, "")
+      .replace(/^Slice\s+\d+\s*[—:-]\s*/i, "")
+      .replace(/^Task\s+\d+\s*[—:-]\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!title || /^auto$/i.test(title)) return;
+    const key = title.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    titles.push(title);
+  };
+
+  for (const match of planText.matchAll(/^#{2,3}\s+((?:Slice|Milestone)\s+\d+\s*[:—-]\s*.+)$/gim)) add(match[1]);
+  for (const match of planText.matchAll(/\*\*(Atomic task\s+[^*]+?)\*\*/gim)) add(match[1]);
+  for (const match of planText.matchAll(/^\s*-\s+Concrete change:\s*(.+)$/gim)) add(match[1]);
+
+  return titles.slice(0, maxCount);
+}
+
+function isTinyDocumentationOnlyGsd(planText: string, workerBudget: GsdWorkerBudget): boolean {
+  if (workerBudget.workerBudget > 6) return false;
+  const text = planText.toLowerCase();
+  return /documentation-only|markdown note|validation note|validation artifact/.test(text)
+    && /no source-code changes|no source code changes/.test(text);
 }
 
 function stamp(): string {
@@ -684,12 +1068,14 @@ function projectFlowPlanningRules(): string {
     "- If web/current docs would materially affect dependency/framework choice or API correctness, use pi-web-access before saving a build-ready plan.",
     "- Do not hide major assumptions in a build-ready plan. If blocking questions remain after the full blocker sweep and grill loop, call project_flow_save_plan with status blocked or draft, unresolvedQuestions, blockerAnalysisSummary, and grillResolutionSummary if any grill rounds occurred; build choices will be withheld.",
     "- If you use scout, researcher, reviewer, pi-web-access, or substantial local inspection during planning, persist the useful result inside the saved plan under a concise `## Planning Evidence` section: source/tool or artifact, key findings, files/URLs checked, and how it changes the plan. Do not rely on invisible parent reasoning or transient chat context.",
+    "- New `/plan` requests are authoritative fresh planning lifecycles, not continuations of the latest saved plan. Previous plans, sessions, and `gsd/*.md` artifacts may be used only as historical progress/evidence to avoid redoing completed work; do not inherit their pending slices, worker budget, or scope unless the user explicitly asks to continue/resume. Only `/plan-continue` and `/gsd-continue` are previous-plan continuation modes.",
+    "- A new plan must decide its own GSD milestones/slices from the current requested changes and scope. Respect completed progress by citing it in Planning Evidence and excluding already-satisfied work, but create the slice set that fits the new request rather than replaying old GSD ledgers.",
     "- If enough information exists, produce a GSD-style plan with milestones, atomic slices, tasks, owned files, decisions, risks, and validation. Include enough slice/risk/validation evidence that build modes can reuse the plan instead of re-scouting.",
     "- GSD atomicity requirement: every slice must be independently verifiable, have one clear goal/user-visible outcome, list owned/shared files, dependencies, parallel-safety/conflict notes, stop/escalation triggers, automatic/manual validation, and required evidence.",
     "- Keep GSD work small enough for fresh worker sessions: split large slices into atomic tasks that one worker can complete and validate in one session. If a slice touches multiple subsystems or has multiple done conditions, break it down further before saving the plan.",
     "- Break each slice into ordered tasks. Each task must name its type (`auto`, `human-verify`, `decision`, or `human-action`), files, concrete change, done condition, validation, and auto-fix policy. Prefer `auto`; use human gates only for unavoidable user validation/action, secrets/auth, package legitimacy, destructive operations, or unapproved product/architecture decisions.",
     "- Split slices further if they touch unrelated behavior/files, cannot be validated independently, require separate architectural decisions, or would make failure attribution unclear. Mark parallel-safe only when dependencies and owned files do not conflict.",
-    `- For Rust/Cargo plans, include Cargo safety in validation: heavy Cargo commands must use an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower, prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}, and mark cargo run for graphical/interactive apps as manual unless explicitly approved.`, 
+    `- For Rust/Cargo plans, include Cargo safety in validation: heavy Cargo commands must use an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower, prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}, and mark cargo run for graphical/interactive apps as manual unless explicitly approved.`,
     "- Save the plan by calling project_flow_save_plan.",
     "- Do not start implementation until the post-plan choice explicitly approves build.",
   ].join("\n");
@@ -804,11 +1190,16 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     renderWidget(ctx);
     setTools(pi, ["read", "bash", "subagent", "project_flow_finish", "project_flow_context", "project_flow_list_modules", "project_flow_read_headers", "project_flow_read_signatures", "project_flow_memory_search"]);
 
+    const ponytailStatus = detectPonytailStatus(ctx.cwd);
+    const identity = makeGsdDisplayIdentity("Plan Implementation Build", "worker", new Set<string>());
+    const aliasFile = ensureProjectFlowDisplayAgentAlias(ctx.cwd, identity);
+
     const bridge = await requestSubagentBridge(pi, withModel({
-      agent: "worker",
-      task: `[PROJECT FLOW: SUBAGENT BUILD]\nPlan file: ${rel(ctx.cwd, planPath)}\n\nRead the written plan and implement only plan-approved changes. Keep scope tight. Reuse any Planning Evidence, slices, risks, and validation sections in the saved plan; do not repeat scouting/research unless that evidence is missing, stale, or contradicted by the current repo state. Validate and return changed files, validation evidence, blockers, and follow-ups. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record. Use only tools/skills needed for this plan; do not inherit or assume parent-only context.`, 
+      agent: identity.displayAgent,
+      thinking: "medium",
+      task: `[PROJECT FLOW: SUBAGENT BUILD]\n${gsdIdentityPrompt(identity)}\n\nPlan file: ${rel(ctx.cwd, planPath)}\n\n${ponytailPromptNote(ponytailStatus)}\n\nRead the written plan and implement only plan-approved changes. Keep scope tight. Reuse any Planning Evidence, slices, risks, and validation sections in the saved plan; do not repeat scouting/research unless that evidence is missing, stale, or contradicted by the current repo state. Validate and return changed files, validation evidence, blockers, and follow-ups. Research gate: do not use web research or researcher unless implementation is blocked by a missing external fact that repo inspection/project memory cannot answer; if so, state that fact, why local evidence is insufficient, and how it affects the build before researching. Cargo safety: heavy Cargo commands must include an explicit job limit of -j ${MAX_SAFE_CARGO_JOBS} or lower; prefer cargo fmt --check and cargo check -j ${MAX_SAFE_CARGO_JOBS}. Do not run cargo run for graphical/interactive apps unless the user explicitly approves that exact step; report it as manual validation instead. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record. Use only tools/skills needed for this plan; do not inherit or assume parent-only context.`,
       reads: [rel(ctx.cwd, planPath)],
-      skill: false,
+      ...ponytailSkillParam(ponytailStatus),
       context: "fresh",
       async: true,
       agentScope: "both",
@@ -829,12 +1220,12 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     renderWidget(ctx);
     const text = bridge.response?.result?.content?.find?.((c: any) => c.type === "text")?.text ?? "Subagent worker started.";
     ctx.ui.notify("Project Flow worker started via AgentAdapter.", "info");
-    pi.sendMessage({ customType: "project-flow-agent-started", content: `# Project Flow Worker Started\n\n${text}`, display: true }, { triggerTurn: false });
+    pi.sendMessage({ customType: "project-flow-agent-started", content: `# Project Flow Worker Started\n\nDisplay alias: ${identity.displayAgent}\nAlias file: ${aliasFile}\n${ponytailPromptNote(ponytailStatus)}\n\n${text}`, display: true }, { triggerTurn: false });
     return;
   }
 
   if (choice === "Build with GSD subagent pipeline") {
-    await launchGsdContinue(pi, ctx, planPath, "Start from the first plan-approved milestone/slice and execute the maximal safe atomic worker chain before human validation/action is truly required.");
+    await launchGsdContinue(pi, ctx, planPath, "Start from the current saved plan. Execute the plan-approved GSD slices for this request; do not reconcile previous GSD ledgers or inherit previous pending slices.", "fresh");
     return;
 
     state.phase = "build_requested";
@@ -918,6 +1309,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     if (preflight.length) chain.push({ parallel: preflight, concurrency: Math.min(3, preflight.length) });
     chain.push({
       agent: "worker",
+      thinking: "medium",
       phase: "Implementation",
       label: "Single writer implementation",
       as: "workerResult",
@@ -955,6 +1347,7 @@ async function chooseAfterPlan(pi: ExtensionAPI, ctx: ExtensionContext, planPath
     });
     chain.push({
       agent: "worker",
+      thinking: "medium",
       phase: "Autofix",
       label: "Apply validation fixes and continue remaining slices",
       as: "autofixResult",
@@ -1061,33 +1454,45 @@ function gsdPrintReport(cwd: string, planPath?: string): string {
   ].join("\n");
 }
 
-async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPath: string, target: string): Promise<void> {
+async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPath: string, target: string, mode: "continue" | "fresh" = "continue"): Promise<void> {
   ensureProjectFlow(ctx.cwd);
   state.phase = "build_requested";
   state.planPath = planPath;
-  state.notes = [...(state.notes ?? []), `/gsd-continue requested${target ? `: ${target}` : ""}`];
+  state.notes = [...(state.notes ?? []), mode === "continue" ? `/gsd-continue requested${target ? `: ${target}` : ""}` : `/gsd fresh build requested${target ? `: ${target}` : ""}`];
   saveState(ctx.cwd);
   renderWidget(ctx);
   setTools(pi, ["read", "bash", "subagent", "project_flow_finish", "project_flow_context", "project_flow_list_modules", "project_flow_read_headers", "project_flow_read_signatures", "project_flow_memory_search"]);
 
   const planRel = rel(ctx.cwd, planPath);
-  const evidenceFiles = gsdEvidenceFiles(ctx.cwd);
-  const evidenceList = evidenceFiles.length ? evidenceFiles.map(p => `- ${p}`).join("\n") : "- No existing gsd/*.md evidence files found.";
-  const resumeTarget = target || "Continue from the first pending milestone/slice after reconciling existing evidence.";
-  const gsdRules = `GSD continue contract:\n- First reconcile the saved plan and existing GSD evidence; do not redo completed milestones/slices/tasks.\n- Write/update gsd/resume-ledger.md with completed, pending, blocked, manual-checkpoint, and continuation-plan items before implementation.\n- Plan the maximal safe dependency-ordered continuation chain before writing code: as many plan-approved atomic auto tasks as can run before human validation/action is absolutely necessary.\n- Do not stop for deferrable human verification; record human-check/UAT items for end-of-chain review unless later work truly depends on the human result.\n- Each implementation worker executes at most one atomic task, then hands off through gsd/continue-task-XX.md; later workers start fresh and continue from the ledger plus prior task summaries.\n- Auto-fix scoped implementation/validation issues up to ${GSD_MAX_AUTOFIX_ATTEMPTS} focused attempts before marking that task blocked and allowing later independent planned tasks to progress when safe.\n- Stop only for unavoidable user validation/action, secrets/auth, package-legitimacy checks, destructive operations, unapproved product/architecture decisions, or when no independent planned task can progress.\n- Final handoff must say whether the overall plan is complete, partial, or blocked; list completed and pending milestones/slices/tasks; list deferred human-check/UAT items and blocking manual checkpoints with steps/expected results; and give the next safe operator instruction.`;
+  const planBody = existsSync(planPath) ? readFileSync(planPath, "utf8") : "";
+  const evidenceFiles = mode === "continue" ? gsdEvidenceFiles(ctx.cwd) : [];
+  const evidenceText = evidenceFiles.map(p => `## ${p}\n${readFileSync(join(ctx.cwd, p), "utf8")}`).join("\n\n");
+  const evidenceList = mode === "continue"
+    ? (evidenceFiles.length ? evidenceFiles.map(p => `- ${p}`).join("\n") : "- No existing gsd/*.md evidence files found.")
+    : "- Fresh GSD build: previous gsd/*.md evidence is intentionally ignored; the current saved plan is the source of truth.";
+  const resumeTarget = target || (mode === "continue" ? "Continue from the first pending milestone/slice after reconciling existing evidence." : "Start from the current saved plan and execute its plan-approved slices without reconciling previous GSD ledgers.");
+  let workerBudget = computeGsdWorkerBudget(planBody, resumeTarget, evidenceText);
+  const freshPlanSliceTitles = mode === "fresh" ? extractGsdAtomicTaskTitles(planBody, GSD_MAX_CONTINUE_TASKS) : [];
+  if (mode === "fresh" && workerBudget.explicitRequestedWorkerCount === undefined && freshPlanSliceTitles.length) {
+    workerBudget = { ...workerBudget, pendingAutoTaskEstimate: freshPlanSliceTitles.length, workerBudget: freshPlanSliceTitles.length, rationale: `fresh saved-plan slice count: ${freshPlanSliceTitles.length}` };
+  }
+  const atomicTaskTitles = extractGsdAtomicTaskTitles(planBody, workerBudget.workerBudget);
+  const tinyDocumentationOnly = isTinyDocumentationOnlyGsd(planBody, workerBudget);
+  const ponytailStatus = detectPonytailStatus(ctx.cwd);
+  const gsdRules = `${mode === "continue" ? "GSD continue contract" : "GSD fresh-plan contract"}:\n- ${mode === "continue" ? "First reconcile the saved plan and existing GSD evidence; do not redo completed milestones/slices/tasks." : "Use the current saved plan as the source of truth; do not reconcile or inherit previous GSD ledgers, previous pending slices, or previous worker budgets."}\n- Selected atomic worker budget: ${workerBudget.workerBudget}. Budget rationale: ${workerBudget.rationale}. Hard cap: ${workerBudget.hardCap}; default batch: ${workerBudget.defaultBatch}.\n- Write/update gsd/resume-ledger.md with completed, pending, blocked, manual-checkpoint, and continuation-plan items before implementation.\n- Plan a sensible dependency-ordered continuation batch before writing code: as many plan-approved atomic auto tasks as needed, but not more than the selected worker budget, before human validation/action is truly required.\n- Do not stop for deferrable human verification; record human-check/UAT items for end-of-chain review unless later work truly depends on the human result.\n- Each implementation worker executes at most one atomic task, then hands off through gsd/continue-task-XX.md; later workers start fresh and continue from the ledger plus prior task summaries.\n- Auto-fix scoped implementation/validation issues up to ${GSD_MAX_AUTOFIX_ATTEMPTS} focused attempts before marking that task blocked and allowing later independent planned tasks to progress when safe.\n- Stop only for unavoidable user validation/action, secrets/auth, package-legitimacy checks, destructive operations, unapproved product/architecture decisions, or when no independent planned task can progress.\n- Final handoff must say whether the overall plan is complete, partial, or blocked; list completed and pending milestones/slices/tasks; list deferred human-check/UAT items and blocking manual checkpoints with steps/expected results; and give the next safe operator instruction.\n- ${ponytailPromptNote(ponytailStatus)}`;
   const gsdAcceptance = {
     criteria: [
-      "Existing GSD evidence is reconciled before implementation and completed work is not redone.",
-      "A completed/pending/blocked/manual checkpoint ledger plus maximal safe continuation plan is written or updated under gsd/resume-ledger.md.",
-      "The continuation plan records as many dependency-ordered plan-approved atomic auto tasks as can run before human validation/action is absolutely necessary.",
-      "Each implementation worker attempts at most one atomic task from the planned safe continuation chain, and later fresh workers continue from prior summaries.",
+      mode === "continue" ? "Existing GSD evidence is reconciled before implementation and completed work is not redone." : "Fresh GSD execution follows the current saved plan without inheriting previous GSD ledgers, pending slices, or worker budgets.",
+      "A completed/pending/blocked/manual checkpoint ledger plus sensible selected-batch continuation plan is written or updated under gsd/resume-ledger.md.",
+      "The continuation plan records as many dependency-ordered plan-approved atomic auto tasks as needed, without exceeding the selected worker budget or launching unnecessary extra workers.",
+      "Each implementation worker attempts at most one atomic task from the selected safe continuation batch, and later fresh workers continue from prior summaries.",
       "Scoped fixable issues are auto-fixed within the configured attempt budget before escalation.",
       "Final output includes exact validation evidence, remaining manual checks, and the next safe user instruction.",
     ],
     evidence: ["changed-files", "commands-run", "validation-output", "residual-risks", "diff-summary"],
-    review: { agent: "reviewer", focus: "Resume correctness: no duplicated completed work, plan adherence, validation, and operator-actionable next steps." },
+    review: { agent: "reviewer", focus: "Resume correctness: no duplicated completed work, selected worker budget adherence, plan adherence, validation, and operator-actionable next steps." },
     stopRules: [
-      "Do not redo completed milestones/slices from existing evidence.",
+      mode === "continue" ? "Do not redo completed milestones/slices from existing evidence." : "Do not use previous GSD evidence as continuation state for this fresh saved-plan run.",
       "Do not expand product scope beyond the saved plan.",
       "Do not make unapproved product or architecture decisions.",
       "Stop only when human validation/action is inevitable before later planned work can safely proceed, or no planned auto task can progress.",
@@ -1095,76 +1500,117 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
     maxFinalizationTurns: GSD_MAX_AUTOFIX_ATTEMPTS,
   };
 
+  const gsdIdentitySlugs = new Set<string>();
+  const resumeIdentity = makeGsdDisplayIdentity("Resume Ledger Planning", "scout", gsdIdentitySlugs);
+  const atomicIdentities = Array.from({ length: workerBudget.workerBudget }, (_v, i) => {
+    const fallback = `Atomic Task ${String(i + 1).padStart(2, "0")}`;
+    const title = atomicTaskTitles[i] || fallback;
+    return makeGsdDisplayIdentity(title, "worker", gsdIdentitySlugs);
+  });
+  const continueValidationIdentity = makeGsdDisplayIdentity("Continuation Chain Review", "reviewer", gsdIdentitySlugs);
+  const scopeValidationIdentity = makeGsdDisplayIdentity("Scope Boundary Review", "reviewer", gsdIdentitySlugs);
+  const gsdRoster = [resumeIdentity, ...atomicIdentities, continueValidationIdentity, scopeValidationIdentity];
+  const gsdAliasFiles = gsdRoster.map(identity => ensureGsdDisplayAgentAlias(ctx.cwd, identity));
+
   const chainSummary = [
-    "# Project Flow GSD Continue Chain",
+    mode === "continue" ? "# Project Flow GSD Continue Chain" : "# Project Flow Fresh Saved-Plan GSD Chain",
     "",
     `Plan: ${planRel}`,
     `Target: ${resumeTarget}`,
     "",
-    "Existing evidence that will be read:",
+    mode === "continue" ? "Existing evidence that will be read:" : "Previous evidence policy:",
     evidenceList,
     "",
+    "Selected worker budget:",
+    `- Explicit count detected: ${workerBudget.explicitRequestedWorkerCount ?? "none"}`,
+    `- Estimated pending auto tasks: ${workerBudget.pendingAutoTaskEstimate ?? "uncertain"}`,
+    `- Default batch: ${workerBudget.defaultBatch}`,
+    `- Hard cap: ${workerBudget.hardCap}`,
+    `- Final atomic worker count: ${workerBudget.workerBudget}`,
+    `- Rationale: ${workerBudget.rationale}`,
+    `- Fast path: ${tinyDocumentationOnly ? "tiny documentation-only context minimization" : "standard GSD context"}`,
+    "",
+    "Planned atomic worker titles:",
+    ...(atomicIdentities.length ? atomicIdentities.map((identity, i) => `- ${i + 1}. ${identity.taskTitle}`) : ["- none"]),
+    "",
+    ...ponytailPreviewLines(ponytailStatus),
+    "",
+    "Worker roster (TUI display aliases):",
+    ...gsdRoster.map((identity, i) => `${i + 1}. ${identity.displayAgent} — slug: ${identity.slug}`),
+    "",
+    `Display alias files: ${gsdAliasFiles.join(", ")}`,
+    "Dependency note: Project Flow writes only project-owned display aliases; pi-subagents package files are not edited.",
+    "",
     "Steps that will run:",
-    "1. Continuation planning (scout): read the plan and existing gsd/*.md evidence; write gsd/resume-ledger.md with completed/pending/blocked/manual checkpoint status plus the maximal safe dependency-ordered atomic task chain.",
-    `2. Atomic task execution: run up to ${GSD_MAX_CONTINUE_TASKS} fresh worker steps, each executing at most one planned atomic task and writing gsd/continue-task-XX.md.`,
-    "3. Validation fanout (reviewers): verify no completed work was redone, workers followed the planned chain one atomic task at a time, validation evidence is sufficient, and deferred human checks/manual checkpoints/next steps are actionable.",
+    mode === "continue"
+      ? "1. Continuation planning (scout): read the plan and existing gsd/*.md evidence; write gsd/resume-ledger.md with completed/pending/blocked/manual checkpoint status plus the selected sensible dependency-ordered atomic task batch."
+      : "1. Fresh saved-plan planning (scout): read the current plan only; write gsd/resume-ledger.md with the current plan's selected dependency-ordered atomic slice batch. Previous GSD ledgers are not continuation state.",
+    workerBudget.workerBudget === 0
+      ? "2. Atomic task execution: 0 atomic workers selected; summary/review only, with no gsd/continue-task-XX.md no-op workers created."
+      : `2. Atomic task execution: run up to ${workerBudget.workerBudget} fresh worker steps, each executing at most one planned atomic task and writing gsd/continue-task-XX.md.`,
+    "3. Validation fanout (reviewers): verify no completed work was redone, no unnecessary extra workers were launched, workers followed the selected chain one atomic task at a time, validation evidence is sufficient, and deferred human checks/manual checkpoints/next steps are actionable.",
     "",
     "Stop conditions:",
     "- unavoidable user validation/action before later planned work can safely proceed, secrets/auth, package-legitimacy checks, destructive operations, unapproved product/architecture decisions, or no planned auto task can progress."
   ].join("\n");
   pi.sendMessage({ customType: "project-flow-gsd-chain-preview", content: chainSummary, display: true }, { triggerTurn: false });
 
-  const atomicWorkerSteps = Array.from({ length: Math.max(1, GSD_MAX_CONTINUE_TASKS) }, (_, i) => {
+  const atomicWorkerSteps = atomicIdentities.map((identity, i) => {
     const n = i + 1;
     const as = `continueTask${n}`;
-    const priorOutputs = Array.from({ length: i }, (_v, j) => `## Prior atomic worker ${j + 1}\n{outputs.continueTask${j + 1}}`).join("\n\n") || "No prior atomic task workers in this /gsd-continue run.";
+    const priorOutputs = Array.from({ length: i }, (_v, j) => `## Prior atomic worker ${j + 1}\n{outputs.continueTask${j + 1}}`).join("\n\n") || `No prior atomic task workers in this ${mode === "continue" ? "/gsd-continue" : "fresh GSD"} run.`;
     return {
-      agent: "worker",
+      agent: identity.displayAgent,
+      thinking: tinyDocumentationOnly ? "low" : "medium",
       phase: "Implementation",
-      label: `Atomic GSD task ${n}`,
+      label: identity.displayName,
       as,
-      task: `[PROJECT FLOW: GSD ATOMIC TASK ${n}]\nPlan file: ${planRel}\nResume target: ${resumeTarget}\n\n${gsdRules}\n\nResume ledger and continuation plan:\n{outputs.resumeLedger}\n\nPrior atomic task results:\n${priorOutputs}\n\nExecute at most ONE next atomic auto task from the Maximal Safe Continuation Chain in gsd/resume-ledger.md. Start fresh: use the ledger and prior atomic task results to identify the first uncompleted planned task that is not blocked. Do not redo completed work. Do not execute two tasks in one worker, even if the next task is small. If no planned task remains, or all remaining tasks are blocked by prior results, write a no-op handoff saying the chain is complete or blocked and do not modify source files.\n\nDo not stop for deferrable human-check/UAT items; record them for end-of-chain review unless later work truly depends on the human result. Stop this task only at a true blocker: required user decision, auth/secret/manual action, package-legitimacy check, destructive operation, unapproved product/architecture decision, or human verification whose result is required before later work can safely proceed. If the current task is blocked but a later independent planned task can safely progress, skip the blocked task with exact rationale and execute that one independent task instead.\n\nValidate the task with focused checks before handoff. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.`,
-      reads: [planRel, ...evidenceFiles],
+      task: `[PROJECT FLOW: GSD ATOMIC TASK ${n}]\n${gsdIdentityPrompt(identity)}\n\nPlan file: ${planRel}\nResume target: ${resumeTarget}\nSelected atomic worker budget: ${workerBudget.workerBudget}\nBudget rationale: ${workerBudget.rationale}\nAssigned display title: ${identity.taskTitle}\nContext mode: ${tinyDocumentationOnly ? "tiny documentation-only fast path; avoid rereading full plan/evidence unless the ledger is insufficient" : "standard GSD handoff"}\n\n${gsdRules}\n\nResume ledger and continuation plan:\n{outputs.resumeLedger}\n\nPrior atomic task results:\n${priorOutputs}\n\nExecute at most ONE next atomic auto task from the selected sensible continuation batch in gsd/resume-ledger.md. Prefer the task matching your assigned display title when it is present and still pending; otherwise use the ledger and prior atomic task results to identify the first uncompleted planned task that is not blocked. Do not redo completed work. Do not execute two tasks in one worker, even if the next task is small. If no planned task remains, or all remaining tasks are blocked by prior results, write a no-op handoff saying the chain is complete or blocked and do not modify source files.\n\nDo not stop for deferrable human-check/UAT items; record them for end-of-chain review unless later work truly depends on the human result. Stop this task only at a true blocker: required user decision, auth/secret/manual action, package-legitimacy check, destructive operation, unapproved product/architecture decision, or human verification whose result is required before later work can safely proceed. If the current task is blocked but a later independent planned task can safely progress, skip the blocked task with exact rationale and execute that one independent task instead.\n\nValidate the task with focused checks before handoff. Cargo safety: heavy Cargo commands must include -j ${MAX_SAFE_CARGO_JOBS} or lower; graphical/interactive cargo run is manual unless explicitly approved. Do not mutate Project Flow lifecycle state directly; return evidence for the parent Project Flow core to record.`,
+      reads: tinyDocumentationOnly ? [] : [planRel],
       output: `gsd/continue-task-${String(n).padStart(2, "0")}.md`,
       outputMode: "file-only",
       progress: true,
+      ...ponytailSkillParam(ponytailStatus),
     };
   });
-  const atomicTaskOutputRefs = atomicWorkerSteps.map((_step, i) => `## Atomic worker ${i + 1}\n{outputs.continueTask${i + 1}}`).join("\n\n");
+  const atomicTaskOutputRefs = atomicWorkerSteps.map((_step, i) => `## Atomic worker ${i + 1}\n{outputs.continueTask${i + 1}}`).join("\n\n") || `No atomic workers were selected for this ${mode === "continue" ? "/gsd-continue" : "fresh GSD"} run; validate the ledger summary/review-only path.`;
 
   const chain: any[] = [
     {
-      agent: "scout",
-      phase: "Continuation planning",
-      label: "GSD resume ledger and continuation plan",
+      agent: resumeIdentity.displayAgent,
+      phase: mode === "continue" ? "Continuation planning" : "Fresh plan slicing",
+      label: resumeIdentity.displayName,
       as: "resumeLedger",
-      task: `[PROJECT FLOW: GSD RESUME + CONTINUATION PLAN]\nPlan file: ${planRel}\nResume target: ${resumeTarget}\n\nExisting evidence files:\n${evidenceList}\n\nRead the saved plan and existing GSD evidence. Do not modify source files. Produce and write an operator-actionable gsd/resume-ledger.md that includes:\n1. completed milestones/slices/tasks with evidence,\n2. pending work,\n3. blocked/manual checkpoints with exact validation steps and expected results,\n4. deferred human-check/UAT items that do NOT block further automation, and\n5. a \"Maximal Safe Continuation Chain\" section.\n\nFor the continuation chain, plan as many dependency-ordered, plan-approved atomic auto tasks as can safely run before human validation/action is absolutely necessary. Prefer chaining dependent tasks sequentially over stopping early, but keep task boundaries atomic: one clear change, owned/shared files, validation, done condition, and handoff evidence. Only stop the chain at a true blocker: required user decision, auth/secret/manual action, package-legitimacy check, destructive operation, unapproved product/architecture decision, or human verification whose result is required before later work can safely proceed. If evidence is ambiguous, mark it uncertain rather than redoing work.`,
+      task: `[PROJECT FLOW: ${mode === "continue" ? "GSD RESUME + CONTINUATION PLAN" : "GSD FRESH SAVED-PLAN SLICE PLAN"}]\n${gsdIdentityPrompt(resumeIdentity)}\n\nPlan file: ${planRel}\nResume target: ${resumeTarget}\nSelected atomic worker budget: ${workerBudget.workerBudget}\nBudget rationale: ${workerBudget.rationale}\n${ponytailPromptNote(ponytailStatus)}\n\n${mode === "continue" ? "Existing evidence files" : "Previous evidence policy"}:\n${evidenceList}\n\n${mode === "continue" ? "Read the saved plan and existing GSD evidence." : "Read the current saved plan. Do not read or infer continuation state from previous gsd/*.md artifacts unless the current plan explicitly cites them as planning evidence."} Do not modify source files. Produce and write an operator-actionable gsd/resume-ledger.md that includes:\n1. completed/already-satisfied work from the current saved plan's own evidence,\n2. pending work for the current requested scope,\n3. blocked/manual checkpoints with exact validation steps and expected results,\n4. deferred human-check/UAT items that do NOT block further automation, and\n5. a \"Selected Sensible Continuation Batch\" section capped at the selected atomic worker budget.\n\nFor the continuation batch, plan as many dependency-ordered, plan-approved atomic auto tasks as needed, but not more than ${workerBudget.workerBudget}, before human validation/action is truly required. If the selected budget is 0, write the ledger as summary/review-only and do not invent no-op worker tasks. Prefer chaining dependent tasks sequentially over stopping early, but keep task boundaries atomic: one clear change, owned/shared files, validation, done condition, and handoff evidence. Only stop the chain at a true blocker: required user decision, auth/secret/manual action, package-legitimacy check, destructive operation, unapproved product/architecture decision, or human verification whose result is required before later work can safely proceed. If evidence is ambiguous, mark it uncertain rather than redoing work.`,
       reads: [planRel, ...evidenceFiles],
       output: "gsd/resume-ledger.md",
       outputMode: "file-only",
+      progress: true,
     },
     ...atomicWorkerSteps,
     {
       parallel: [
         {
-          agent: "reviewer",
+          agent: continueValidationIdentity.displayAgent,
           phase: "Validation",
-          label: "Resume/implementation validation",
+          label: continueValidationIdentity.displayName,
           as: "continueValidation",
-          task: `Validate the resumed GSD work against ${planRel}. Start from resume ledger and continuation plan: {outputs.resumeLedger}\n\nAtomic worker results:\n${atomicTaskOutputRefs}. Do not modify project/source files. Verify completed work was not redone, each worker executed at most one planned atomic task, workers followed the planned maximal safe continuation chain, pending work is accurately marked, validation evidence is sufficient, and deferred human checks/blockers/manual checkpoints are exact and actionable.`,
+          task: `[PROJECT FLOW: GSD VALIDATION]\n${gsdIdentityPrompt(continueValidationIdentity)}\n\nValidate the resumed GSD work against ${planRel}. Selected atomic worker budget: ${workerBudget.workerBudget}. Budget rationale: ${workerBudget.rationale}. ${ponytailPromptNote(ponytailStatus)} Start from resume ledger and continuation plan: {outputs.resumeLedger}\n\nAtomic worker results:\n${atomicTaskOutputRefs}. Do not modify project/source files. Verify completed work was not redone, no unnecessary extra workers were launched, each worker executed at most one planned atomic task, workers followed the selected sensible continuation batch, pending work is accurately marked, validation evidence is sufficient, and deferred human checks/blockers/manual checkpoints are exact and actionable.`,
           reads: [planRel],
           output: "gsd/continue-validation.md",
           outputMode: "file-only",
+          progress: true,
         },
         {
-          agent: "reviewer",
+          agent: scopeValidationIdentity.displayAgent,
           phase: "Validation",
-          label: "Scope/manual checkpoint validation",
+          label: scopeValidationIdentity.displayName,
           as: "continueScopeValidation",
-          task: `Validate scope control and manual checkpoint clarity after resumed GSD work. Start from resume ledger and continuation plan: {outputs.resumeLedger}\n\nAtomic worker results:\n${atomicTaskOutputRefs}. Do not modify project/source files. Report whether the continuation planning chained as much safe work as possible before true human validation/action, whether fresh workers respected atomic task boundaries, whether the user can safely run /gsd-continue again, must perform manual validation first, or the overall plan is complete.`,
+          task: `[PROJECT FLOW: GSD SCOPE REVIEW]\n${gsdIdentityPrompt(scopeValidationIdentity)}\n\nValidate scope control, selected worker budget adherence, and manual checkpoint clarity after resumed GSD work. Selected atomic worker budget: ${workerBudget.workerBudget}. Budget rationale: ${workerBudget.rationale}. ${ponytailPromptNote(ponytailStatus)} Start from resume ledger and continuation plan: {outputs.resumeLedger}\n\nAtomic worker results:\n${atomicTaskOutputRefs}. Do not modify project/source files. Report whether the continuation planning chained the needed safe work without exceeding the selected budget, whether fresh workers respected atomic task boundaries, whether the user can safely run /gsd-continue again, must perform manual validation first, or the overall plan is complete.`,
           reads: [planRel],
           output: "gsd/continue-scope-validation.md",
           outputMode: "file-only",
+          progress: true,
         },
       ],
       concurrency: 2,
@@ -1191,9 +1637,9 @@ async function launchGsdContinue(pi: ExtensionAPI, ctx: ExtensionContext, planPa
   state.phase = "building";
   saveState(ctx.cwd);
   renderWidget(ctx);
-  const text = bridge.response?.result?.content?.find?.((c: any) => c.type === "text")?.text ?? "GSD continue pipeline started.";
-  ctx.ui.notify("Project Flow /gsd-continue pipeline started.", "info");
-  pi.sendMessage({ customType: "project-flow-agent-started", content: `# Project Flow GSD Continue Started\n\nPlan: ${planRel}\nTarget: ${resumeTarget}\n\n${text}`, display: true }, { triggerTurn: false });
+  const text = bridge.response?.result?.content?.find?.((c: any) => c.type === "text")?.text ?? (mode === "continue" ? "GSD continue pipeline started." : "Fresh GSD pipeline started.");
+  ctx.ui.notify(mode === "continue" ? "Project Flow /gsd-continue pipeline started." : "Project Flow fresh GSD pipeline started.", "info");
+  pi.sendMessage({ customType: "project-flow-agent-started", content: `# ${mode === "continue" ? "Project Flow GSD Continue Started" : "Project Flow Fresh GSD Started"}\n\nPlan: ${planRel}\nTarget: ${resumeTarget}\nSelected atomic workers: ${workerBudget.workerBudget}\nBudget rationale: ${workerBudget.rationale}\n${ponytailPromptNote(ponytailStatus)}\n\n${text}`, display: true }, { triggerTurn: false });
 }
 
 export default function projectFlow(pi: ExtensionAPI): void {
@@ -1506,7 +1952,7 @@ export default function projectFlow(pi: ExtensionAPI): void {
         learnings: join(ctx.cwd, MEMORY_DIR, "learnings.md"),
         validation: join(ctx.cwd, MEMORY_DIR, "validation.md"),
         "model-policy": join(ctx.cwd, MEMORY_DIR, "model-policy.md"),
-        "latest-plan": latestFile(ctx.cwd, PLANS_DIR, ".md"),
+        "latest-plan": state.planPath,
         "plan-template": join(ctx.cwd, "unified-project-flow", "templates", "plan-template.md"),
       };
       const path = moduleName
@@ -1714,10 +2160,14 @@ export default function projectFlow(pi: ExtensionAPI): void {
           record("AgentAdapter foreground worker", false, `refusing build self-test outside ${expectedCwd}`);
         } else {
           const outRel = `${SELF_TEST_DIR}/hello.txt`;
+          const ponytailStatus = detectPonytailStatus(ctx.cwd);
+          const identity = makeGsdDisplayIdentity("Self Validation Build", "worker", new Set<string>());
+          ensureProjectFlowDisplayAgentAlias(ctx.cwd, identity);
           const worker = await requestSubagentBridge(pi, withModel({
-            agent: "worker",
-            task: `Project Flow self-validation build test running in ${expectedCwd}. Create or overwrite only ${outRel} with exactly: hello from project-flow self-validation. Do not touch other files. Then verify the file exists and report evidence.`,
-            skill: false,
+            agent: identity.displayAgent,
+            thinking: "medium",
+            task: `${gsdIdentityPrompt(identity)}\n\n${ponytailPromptNote(ponytailStatus)}\n\nProject Flow self-validation build test running in ${expectedCwd}. Create or overwrite only ${outRel} with exactly: hello from project-flow self-validation. Do not touch other files. Then verify the file exists and report evidence.`,
+            ...ponytailSkillParam(ponytailStatus),
             context: "fresh",
             async: false,
             agentScope: "both",
@@ -1767,11 +2217,15 @@ export default function projectFlow(pi: ExtensionAPI): void {
       saveState(ctx.cwd);
       renderWidget(ctx);
       const outRel = `${SELF_TEST_DIR}/e2e.txt`;
+      const ponytailStatus = detectPonytailStatus(ctx.cwd);
+      const identity = makeGsdDisplayIdentity("Confined E2E Build", "worker", new Set<string>());
+      ensureProjectFlowDisplayAgentAlias(ctx.cwd, identity);
       const bridge = await requestSubagentBridge(pi, withModel({
-        agent: "worker",
-        task: `Project Flow E2E confined build in ${expectedCwd}. Read plan ${rel(ctx.cwd, planPath)}. Create or overwrite only ${outRel} with exactly: project-flow e2e ok. Do not touch other files. Verify file exists and report evidence.`,
+        agent: identity.displayAgent,
+        thinking: "medium",
+        task: `${gsdIdentityPrompt(identity)}\n\n${ponytailPromptNote(ponytailStatus)}\n\nProject Flow E2E confined build in ${expectedCwd}. Read plan ${rel(ctx.cwd, planPath)}. Create or overwrite only ${outRel} with exactly: project-flow e2e ok. Do not touch other files. Verify file exists and report evidence.`,
         reads: [rel(ctx.cwd, planPath)],
-        skill: false,
+        ...ponytailSkillParam(ponytailStatus),
         context: "fresh",
         async: false,
         agentScope: "both",
@@ -1869,7 +2323,7 @@ export default function projectFlow(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("gsd", {
-    description: "Alias for /gsd-continue",
+    description: "Start a fresh GSD run for the active Project Flow plan; use /gsd-continue to reconcile previous GSD evidence",
     handler: async (args, ctx) => {
       ensureProjectFlow(ctx.cwd);
       const loaded = latestSession(ctx.cwd);
@@ -1879,14 +2333,14 @@ export default function projectFlow(pi: ExtensionAPI): void {
       const candidatePath = first ? (first.startsWith("/") ? first : join(ctx.cwd, first)) : "";
       const planPath = candidatePath && existsSync(candidatePath)
         ? candidatePath
-        : state.planPath || latestFile(ctx.cwd, PLANS_DIR, ".md");
+        : state.planPath;
       if (!planPath || !existsSync(planPath)) {
-        ctx.ui.notify("No Project Flow plan found for /gsd. Run /plan first or pass a plan path.", "warning");
-        pi.sendMessage({ customType: "project-flow-gsd-continue", content: "# Project Flow GSD\n\nNo saved Project Flow plan was found. Run `/plan <task>` first, or pass a plan path: `/gsd .pi/project-flow/plans/<plan>.md`.", display: true }, { triggerTurn: false });
+        ctx.ui.notify("No active Project Flow plan found for /gsd. Run /plan first, choose GSD after saving, or pass a plan path.", "warning");
+        pi.sendMessage({ customType: "project-flow-gsd", content: "# Project Flow GSD\n\nNo active Project Flow plan was found. Run `/plan <task>` first, or pass a plan path for a fresh saved-plan GSD run: `/gsd .pi/project-flow/plans/<plan>.md`. Use `/gsd-continue` when you intentionally want to reconcile previous GSD evidence.", display: true }, { triggerTurn: false });
         return;
       }
       const target = candidatePath && existsSync(candidatePath) ? raw.slice(first.length).trim() : raw;
-      await launchGsdContinue(pi, ctx, planPath, target);
+      await launchGsdContinue(pi, ctx, planPath, target || "Start from the current saved plan. Execute its plan-approved slices; do not reconcile previous GSD ledgers.", "fresh");
     },
   });
 
