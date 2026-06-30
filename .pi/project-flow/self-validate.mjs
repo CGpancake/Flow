@@ -78,8 +78,8 @@ for (const label of [
 }
 record('plan-continue reopens post-plan selector', /\["plan_ready", "build_requested", "building", "validating"\]\.includes\(state\.phase\)[\s\S]*await chooseAfterPlan\(pi, ctx, latestPlanPath\)/.test(ext));
 record('stop process does not start a build', /Stop process \/ no build/.test(ext) && /stopPostPlanProcess/.test(ext));
-record('subagent build is bridge-mediated', /requestSubagentBridge\(pi, withModel\(\{\s*agent:\s*"worker"[\s\S]*async:\s*true/.test(ext));
-record('foreground e2e worker is bridge-mediated', /requestSubagentBridge\(pi, withModel\(\{\s*agent:\s*"worker"[\s\S]*async:\s*false/.test(ext));
+record('subagent build is bridge-mediated', /requestSubagentBridge\(pi, withModel\(\{[\s\S]*agent:\s*identity\.displayAgent[\s\S]*async:\s*true/.test(ext));
+record('foreground e2e worker is bridge-mediated', /requestSubagentBridge\(pi, withModel\(\{[\s\S]*agent:\s*identity\.displayAgent[\s\S]*async:\s*false/.test(ext));
 record('grill rules included in plan prompt', /Use the Grill rules/.test(ext) && /project_flow_grill_question/.test(ext));
 record('grill captures recommendation alternatives and context', /Recommended:/.test(ext) && /Alternative/.test(ext) && /Additional context/.test(ext));
 record('grill loop requires revision before final plan', /Grill loop requirement/.test(ext) && /grillResolutionSummary/.test(ext));
@@ -105,7 +105,7 @@ record('plan prompt prefers memory search', /project_flow_memory_search for long
 record('finish required after existing-context build', /call project_flow_finish with status complete or failed/.test(ext));
 record('model routing is configurable, not hardcoded', /PI_PROJECT_FLOW_WORKER_MODEL/.test(ext) && /withModel/.test(ext));
 record('subagent plan handoff uses reads', /reads:\s*\[rel\(ctx\.cwd, planPath\)\]/.test(ext));
-record('subagent skill bleed disabled by default', /skill:\s*false/.test(ext));
+record('GSD worker aliases request ponytail only for workers', /worker:[\s\S]*skills: ponytail/.test(ext) && !/scout:[\s\S]*skills: ponytail[\s\S]*worker:/.test(ext) && !/reviewer:[\s\S]*skills: ponytail/.test(ext));
 record('planning bash is guarded read-only', /isSafeReadOnlyBash/.test(ext) && /Project Flow planning permits only read-only shell inspection/.test(ext));
 record('cargo build safety guard present', /MAX_SAFE_CARGO_JOBS/.test(ext) && /cargoSafetyReason/.test(ext) && /explicit job limit/.test(ext));
 record('cargo run guarded for graphical apps', /PI_PROJECT_FLOW_ALLOW_CARGO_RUN=1/.test(ext) && /will not auto-run graphical\/interactive Cargo apps/.test(ext));
