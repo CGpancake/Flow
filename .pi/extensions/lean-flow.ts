@@ -184,6 +184,10 @@ function taskAge(task: LeanTaskProgress): string | undefined {
 	return task.startedAt ? `${Math.max(0, Math.round(((task.endedAt ?? Date.now()) - task.startedAt) / 1000))}s` : undefined;
 }
 
+function queuedText(task: LeanTaskProgress): string {
+	return task.parallel ? "queued ∥" : "queued";
+}
+
 async function runPiChild(ctx: ExtensionContext, task: LeanTask, contextWindow: number | undefined, signal?: AbortSignal, onData?: (progress: ChildProgress) => void): Promise<{ code: number | null; output: string }> {
 	const agent = AGENTS[task.agent];
 	const usage = emptyUsage(contextWindow);
@@ -567,7 +571,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 				return progress.map((task) => {
 					const icon = task.status === "running" ? "⠋" : task.status === "done" ? "✓" : task.status === "failed" ? "✗" : "◦";
 					const title = `${icon} ${task.label}`;
-					if (task.status === "queued") return `${title} - queued`;
+					if (task.status === "queued") return `${title} - ${queuedText(task)}`;
 					return `${truncateToWidth(title, titleWidth, "…", true)}${statusRail(task)} ${task.status}`;
 				}).join("\n");
 			};
@@ -652,7 +656,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 						const status = task.status ?? d.statuses?.[i] ?? "queued";
 						const color = status === "running" ? "accent" : status === "done" ? "success" : status === "failed" ? "error" : "borderAccent";
 						const title = titles[i]!;
-						if (status === "queued") return theme.fg("dim", truncateToWidth(`${title} - queued`, width, "…"));
+						if (status === "queued") return theme.fg("dim", truncateToWidth(`${title} - ${queuedText(task)}`, width, "…"));
 						const railText = statusRail(task, status === "running" ? runningCtxIcon : "/");
 						const stateText = ` ${status}`;
 						const left = theme.fg(color, truncateToWidth(title, titleWidth, "…", true));
