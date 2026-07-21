@@ -571,8 +571,9 @@ export default function leanFlow(pi: ExtensionAPI) {
 				return progress.map((task) => {
 					const icon = task.status === "running" ? "⠋" : task.status === "done" ? "✓" : task.status === "failed" ? "✗" : "◦";
 					const title = `${icon} ${task.label}`;
-					if (task.status === "queued") return `${title} - ${queuedText(task)}`;
-					return `${truncateToWidth(title, titleWidth, "…", true)}${statusRail(task)} ${task.status}`;
+					const left = truncateToWidth(title, titleWidth, "…", true);
+					if (task.status === "queued") return `${left} - ${queuedText(task)}`;
+					return `${left}${statusRail(task)} ${task.status}`;
 				}).join("\n");
 			};
 			const publish = () => {
@@ -649,18 +650,20 @@ export default function leanFlow(pi: ExtensionAPI) {
 					});
 					const activeRightWidth = Math.max(0, ...d.tasks.map((task, i) => {
 						const status = task.status ?? d.statuses?.[i] ?? "queued";
-						return status === "queued" ? 0 : visibleWidth(statusRail(task, status === "running" ? runningCtxIcon : "/")) + visibleWidth(` ${status}`);
+						return status === "queued"
+							? visibleWidth(` - ${queuedText(task)}`)
+							: visibleWidth(statusRail(task, status === "running" ? runningCtxIcon : "/")) + visibleWidth(` ${status}`);
 					}));
 					const titleWidth = Math.min(Math.max(...titles.map(visibleWidth)), Math.max(0, width - activeRightWidth));
 					const lines: string[] = d.tasks.map((task, i) => {
 						const status = task.status ?? d.statuses?.[i] ?? "queued";
 						const color = status === "running" ? "accent" : status === "done" ? "success" : status === "failed" ? "error" : "borderAccent";
 						const title = titles[i]!;
-						if (status === "queued") return theme.fg("dim", truncateToWidth(`${title} - ${queuedText(task)}`, width, "…"));
+						const left = truncateToWidth(title, titleWidth, "…", true);
+						if (status === "queued") return theme.fg("dim", `${left} - ${queuedText(task)}`);
 						const railText = statusRail(task, status === "running" ? runningCtxIcon : "/");
 						const stateText = ` ${status}`;
-						const left = theme.fg(color, truncateToWidth(title, titleWidth, "…", true));
-						return left + theme.fg(color, railText) + theme.fg(color, stateText);
+						return theme.fg(color, left) + theme.fg(color, railText) + theme.fg(color, stateText);
 					});
 					if (options.expanded) {
 						const task = d.tasks[d.current];
