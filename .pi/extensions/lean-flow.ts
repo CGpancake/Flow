@@ -83,6 +83,25 @@ type LeanChainDetails = {
 	currentOutput?: string;
 };
 
+type LeanChainResult = {
+	content: { type: "text"; text: string }[];
+	details?: LeanChainDetails | Record<string, unknown>;
+	isError?: boolean;
+};
+
+type LeanChainUpdate = {
+	content: { type: "text"; text: string }[];
+	details: LeanChainDetails;
+};
+
+type ActiveWorkJob = {
+	tasks: LeanTask[];
+	progress: LeanTaskProgress[];
+	details: LeanChainDetails;
+	controller: AbortController;
+	startedAt: number;
+};
+
 const AGENTS: Record<LeanTask["agent"], { tools: string; prompt: string }> = {
 	worker: {
 		tools: "read,bash,edit,write",
@@ -377,7 +396,258 @@ function looksExplicitlyNarrow(task: string): boolean {
 		|| /\bnarrow-task-ok\b/i.test(task);
 }
 
+function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded: boolean }, theme: ExtensionContext["ui"]["theme"]) {
+	return {
+		invalidate() {},
+		render(width: number) {
+			if (!d?.tasks?.length) return [];
+			const age = (task: LeanTaskProgress) => taskAge(task);
+			const runningFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+			const ctxFrames = ["◜", "◝", "◞", "◟"];
+			const frameIndex = Math.floor(Date.now() / 80);
+			const runningIcon = runningFrames[frameIndex % runningFrames.length]!;
+			const runningCtxIcon = ctxFrames[frameIndex % ctxFrames.length]!;
+			const titles = d.tasks.map((task, i) => {
+				const status = task.status ?? d.statuses?.[i] ?? "queued";
+				const icon = status === "running" ? runningIcon : status === "done" ? "◆" : status === "failed" ? "✖" : "◇";
+				return `${icon} ${task.label}`;
+			});
+			const activeRightWidth = Math.max(0, ...d.tasks.map((task, i) => {
+				const status = task.status ?? d.statuses?.[i] ?? "queued";
+				return status === "queued"
+					? visibleWidth(` - ${queuedText(task)}`)
+					: visibleWidth(statusRail(task, status === "running" ? runningCtxIcon : "/")) + visibleWidth(` ${status}`);
+			}));
+			const titleWidth = Math.min(Math.max(...titles.map(visibleWidth)), Math.max(0, width - activeRightWidth));
+			const lines: string[] = d.tasks.map((task, i) => {
+				const status = task.status ?? d.statuses?.[i] ?? "queued";
+				const color = status === "running" ? "accent" : status === "done" ? "success" : status === "failed" ? "error" : "borderAccent";
+				const title = titles[i]!;
+				const left = truncateToWidth(title, titleWidth, "…", true);
+				if (status === "queued") return theme.fg("dim", `${left} - ${queuedText(task)}`);
+				const railText = statusRail(task, status === "running" ? runningCtxIcon : "/");
+				const stateText = ` ${status}`;
+				return theme.fg(color, left) + theme.fg(color, railText) + theme.fg(color, stateText);
+			});
+			if (options.expanded) {
+				const task = d.tasks[d.current];
+				lines.push(theme.fg("borderMuted", "─".repeat(Math.min(width, 80))));
+				if (task) {
+					const meta = [formatUsage(task.usage), task.startedAt ? age(task) : undefined, task.thinking].filter(Boolean).join(" • ");
+					lines.push(theme.fg("accent", `${task.label}${meta ? ` (${meta})` : ""}`));
+				}
+				const output = task?.output ?? d.currentOutput;
+				lines.push(theme.fg("muted", "Feed:"));
+				if (output) lines.push(...output.split(/\r?\n/).slice(-16).map((line) => `  ${line}`));
+				else lines.push(theme.fg("dim", "  waiting for child event stream..."));
+				lines.push(theme.fg("dim", "Esc/Ctrl+C cancels."));
+			}
+			return lines.map((line) => truncateToWidth(line, width));
+		},
+	};
+}
+
+function stripPlanParallelMarker(text: string): string {
+	return text.replace(/\s\[parallel(?::[^\]]+)?\]\s*$/i, "").trim();
+}
+
+function taskLabel(text: string): string {
+	return stripPlanParallelMarker(text).replace(/[`*_#>[\]()]/g, " ").trim().split(/\s+/).filter(Boolean).slice(0, 3).join(" ") || "Lean work";
+}
+
+function planStepParallel(body: string): boolean {
+	return stripPlanParallelMarker(body) !== body.trim();
+}
+
+function tasksFromPlan(cwd: string, args: string): LeanTask[] {
+	const path = join(cwd, CONFIG_DIR_NAME, "lean-flow", "plan.md");
+	if (!existsSync(path)) return [{ agent: "worker", label: "Lean work", task: args.trim() || "Implement the next approved chunk." }];
+	const text = readFileSync(path, "utf8");
+	const section = text.split(/\n##\s+Implementation\s*\n/i)[1]?.split(/\n##\s+/)[0] ?? text;
+	const wantedStep = args.match(/\b(?:step|item|part)\s*#?\s*(\d+)\b/i)?.[1];
+	const planSteps = [...section.matchAll(/^\s*(\d+)\.\s+(.+)$/gm)]
+		.map((match) => {
+			const rawBody = match[2]!.trim();
+			return { step: match[1]!, body: stripPlanParallelMarker(rawBody), markedParallel: planStepParallel(rawBody) };
+		})
+		.filter((step) => !wantedStep || step.step === wantedStep);
+	const tasks = planSteps.map((planStep, index) => {
+		const hasParallelNeighbor = planStep.markedParallel && Boolean(planSteps[index - 1]?.markedParallel || planSteps[index + 1]?.markedParallel);
+		return {
+			agent: "worker" as const,
+			label: taskLabel(planStep.body),
+			task: `Implement plan step ${planStep.step}: ${planStep.body}${args.trim() ? `\n\nExtra instruction: ${args.trim()}` : ""}`,
+			parallel: hasParallelNeighbor || undefined,
+		};
+	});
+	// Ponytail ceiling: this only extracts flat numbered plan items; nested/semantic "next approved chunk" selection still belongs to a parent planning turn.
+	return tasks.length ? tasks : [{ agent: "worker", label: "Lean work", task: `${args.trim() || "Implement the next approved chunk."}\n\nPlan:\n${text.slice(0, 4000)}` }];
+}
+
+function initialDetails(tasks: LeanTask[]): LeanChainDetails {
+	const progress: LeanTaskProgress[] = tasks.map((task) => ({ ...task, status: "queued", latest: "queued" }));
+	return { tasks: progress, current: 0, statuses: progress.map((task) => task.status), currentTask: progress[0]?.task };
+}
+
+function latestWorkLine(tasks: LeanTaskProgress[]): string | undefined {
+	return tasks.find((task) => task.status === "running")?.latest
+		?? [...tasks].reverse().find((task) => task.latest)?.latest;
+}
+
+function formatWorkStatus(activeWorkJob: ActiveWorkJob | undefined, options: { feedTail?: boolean | number } = {}): string {
+	if (!activeWorkJob) return "/work idle";
+	const elapsed = compactDuration(Date.now() - activeWorkJob.startedAt);
+	const feedTailLines = typeof options.feedTail === "number" ? Math.max(0, options.feedTail) : options.feedTail ? 8 : 0;
+	const lines = [`/work active ${elapsed}`];
+	for (const task of activeWorkJob.progress) {
+		const usage = task.usage;
+		const ctx = contextPercent(usage);
+		const ctxTokens = usage?.contextTokens ? formatTokens(usage.contextTokens) : "--";
+		const input = usage?.input ? formatTokens(usage.input) : "--";
+		const output = usage?.output ? formatTokens(usage.output) : "--";
+		lines.push(`- ${task.label}: ${task.status} ctx ${ctx} ${ctxTokens} in ${input} out ${output}`);
+	}
+	const latest = latestWorkLine(activeWorkJob.progress);
+	if (latest) lines.push(`latest: ${latest}`);
+	if (feedTailLines > 0) {
+		const feed = activeWorkJob.progress
+			.filter((task) => task.status === "running" && task.output)
+			.flatMap((task) => task.output!.split(/\r?\n/).filter(Boolean).map((line) => `${task.label}: ${line}`))
+			.slice(-feedTailLines);
+		if (feed.length) lines.push("feed:", ...feed.map((line) => `  ${line}`));
+	}
+	return lines.join("\n");
+}
+
+function workSummary(status: "complete" | "cancelled" | "failed", tasks: LeanTaskProgress[], reason?: string): string {
+	const counts = tasks.reduce<Record<LeanTaskProgress["status"], number>>((acc, task) => {
+		acc[task.status]++;
+		return acc;
+	}, { queued: 0, running: 0, done: 0, failed: 0 });
+	const failed = tasks.filter((task) => task.status === "failed").map((task) => task.label).slice(0, 2).join(", ");
+	const suffix = reason ? `: ${reason.split(/\r?\n/)[0]?.slice(0, 160)}` : failed ? `: ${failed}` : "";
+	return `/work ${status}: ${counts.done} done, ${counts.failed} failed, ${counts.running + counts.queued} pending${suffix}`;
+}
+
+function sendWorkSummary(pi: ExtensionAPI, summary: string): void {
+	pi.sendMessage({ customType: "lean-work-summary", content: summary, display: true }, { deliverAs: "followUp" });
+}
+
+function sendWorkStatus(pi: ExtensionAPI, status: string): void {
+	pi.sendMessage({ customType: "lean-work-status", content: status, display: true }, { deliverAs: "followUp" });
+}
+
+const MUTATING_BASH_RE = /(^|[;&|()\s])(rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|tee|truncate|git\s+(apply|checkout|clean|commit|merge|rebase|reset|restore|switch)|npm\s+(i|install|add|update)|pnpm\s+(add|install|update)|yarn\s+(add|install|upgrade))\b|(^|[^<])>[^>]|>>/;
+
+function isMutatingParentTool(toolName: string, input: unknown): boolean {
+	if (toolName === "edit" || toolName === "write" || toolName === "save_lean_plan") return true;
+	if (toolName === "lean_subagent_chain") return Array.isArray((input as { tasks?: unknown })?.tasks) && ((input as { tasks: LeanTask[] }).tasks).some((task) => task?.agent === "worker");
+	if (toolName === "bash") return MUTATING_BASH_RE.test(String((input as { command?: unknown })?.command ?? ""));
+	return false;
+}
+
 export default function leanFlow(pi: ExtensionAPI) {
+	let activeWorkJob: ActiveWorkJob | undefined;
+
+	const runLeanChain = async (ctx: ExtensionContext, inputTasks: LeanTask[], signal?: AbortSignal, publish?: (update: LeanChainUpdate) => void): Promise<LeanChainResult> => {
+		if (inputTasks.length === 0) return { content: [{ type: "text" as const, text: "No lean subagent tasks." }] };
+		const workerTasks = inputTasks.filter((task) => task.agent === "worker");
+		const planSteps = leanPlanStepCount(ctx.cwd);
+		if (workerTasks.length === 1 && planSteps > 1 && !looksExplicitlyNarrow(workerTasks[0]!.task)) {
+			return {
+				content: [{ type: "text" as const, text: `Plan has ${planSteps} numbered implementation steps, but only one broad worker task was submitted. Split the work into atomic worker tasks, normally at least one per plan step. If this is intentionally narrow, mention the exact step or include narrow-task-ok.` }],
+				isError: true,
+				details: { planSteps, workerTasks: workerTasks.length },
+			};
+		}
+		for (const task of inputTasks) {
+			const words = task.label.trim().split(/\s+/).filter(Boolean);
+			if (words.length > 3) {
+				return { content: [{ type: "text" as const, text: `Task label too long: "${task.label}". Use 3 words or fewer.` }], isError: true };
+			}
+		}
+		let current = 0;
+		const progress: LeanTaskProgress[] = inputTasks.map((task) => ({ ...task, status: "queued", latest: "queued" }));
+		const details = (): LeanChainDetails => {
+			const usage = ctx.getContextUsage();
+			const usageText = usage?.tokens ? `${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()} (${usage.percent?.toFixed(0) ?? "?"}%)` : undefined;
+			const thinking = pi.getThinkingLevel();
+			if (progress[current]) {
+				progress[current].thinking = thinking;
+			}
+			return {
+				tasks: progress,
+				current,
+				statuses: progress.map((task) => task.status),
+				usage: usageText,
+				thinking,
+				currentTask: progress[current]?.task,
+				currentOutput: progress[current]?.output?.slice(-2000),
+			};
+		};
+		const plainSummary = () => {
+			const titleWidth = Math.max(...progress.map((task) => visibleWidth(`◦ ${task.label}`)));
+			return progress.map((task) => {
+				const icon = task.status === "running" ? "⠋" : task.status === "done" ? "✓" : task.status === "failed" ? "✗" : "◦";
+				const title = `${icon} ${task.label}`;
+				const left = truncateToWidth(title, titleWidth, "…", true);
+				if (task.status === "queued") return `${left} - ${queuedText(task)}`;
+				return `${left}${statusRail(task)} ${task.status}`;
+			}).join("\n");
+		};
+		const emit = () => {
+			publish?.({ content: [{ type: "text", text: plainSummary() }], details: details() });
+		};
+		const outputs: string[] = [];
+		emit();
+		const runTask = async (i: number): Promise<{ index: number; code: number | null; output: string }> => {
+			const task = progress[i]!;
+			current = i;
+			task.status = "running";
+			task.latest = "starting";
+			task.phase = "starting";
+			task.startedAt = Date.now();
+			task.updatedAt = task.startedAt;
+			task.output = "";
+			emit();
+			const result = await runPiChild(ctx, task, ctx.model?.contextWindow, signal, (childProgress) => {
+				current = i;
+				Object.assign(task, childProgress);
+				task.updatedAt = Date.now();
+				task.output = task.output?.slice(-4000);
+				task.latest = task.latest?.slice(0, 160) || "working";
+				emit();
+			}).catch((error) => ({
+				code: 1,
+				output: error instanceof Error ? error.message : String(error),
+			}));
+			task.status = result.code === 0 ? "done" : "failed";
+			task.endedAt = Date.now();
+			task.updatedAt = task.endedAt;
+			task.output = result.output.slice(-4000);
+			task.latest = result.code === 0 ? "done" : `failed: exit ${result.code}`;
+			emit();
+			return { index: i, code: result.code, output: result.output };
+		};
+		for (let i = 0; i < progress.length;) {
+			const batch: number[] = [i];
+			if (progress[i]!.parallel) {
+				while (i + batch.length < progress.length && progress[i + batch.length]!.parallel) batch.push(i + batch.length);
+			}
+			current = batch[0]!;
+			const tick = setInterval(emit, 80);
+			const results = await Promise.all(batch.map((index) => runTask(index))).finally(() => clearInterval(tick));
+			results.sort((a, b) => a.index - b.index);
+			for (const result of results) {
+				const task = progress[result.index]!;
+				outputs.push(`\n## ${result.index + 1}. ${task.label} (${task.agent}, exit ${result.code})\n\n${result.output}`);
+			}
+			if (results.some((result) => result.code !== 0)) break;
+			i += batch.length;
+		}
+		return { content: [{ type: "text" as const, text: "Lean chain complete." }], details: details() };
+	};
+
 	pi.on("session_start", async (_event, ctx) => {
 		renderEyeHeader(ctx);
 		ctx.ui.setStatus("lean-flow", ctx.ui.theme.fg("accent", "lean"));
@@ -389,6 +659,12 @@ export default function leanFlow(pi: ExtensionAPI) {
 			? `\n\n[LEAN FLOW CONTEXT WARNING] Context is about ${usage.percent.toFixed(0)}%. Generate a /handover and stop unless the user explicitly wants to continue.`
 			: "";
 		return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${LEAN_SYSTEM}${warning}` };
+	});
+
+	pi.on("tool_call", (event) => {
+		if (!activeWorkJob || activeWorkJob.controller.signal.aborted) return;
+		if (!isMutatingParentTool(event.toolName, event.input)) return;
+		return { block: true, reason: "/work is active; mutating parent tools are paused until it completes or /work-cancel is used." };
 	});
 
 	pi.registerTool({
@@ -530,157 +806,14 @@ export default function leanFlow(pi: ExtensionAPI) {
 			})),
 		}),
 		async execute(_id, params, signal, onUpdate, ctx) {
-			const inputTasks = params.tasks as LeanTask[];
-			if (inputTasks.length === 0) return { content: [{ type: "text", text: "No lean subagent tasks." }] };
-			const workerTasks = inputTasks.filter((task) => task.agent === "worker");
-			const planSteps = leanPlanStepCount(ctx.cwd);
-			if (workerTasks.length === 1 && planSteps > 1 && !looksExplicitlyNarrow(workerTasks[0]!.task)) {
-				return {
-					content: [{ type: "text", text: `Plan has ${planSteps} numbered implementation steps, but only one broad worker task was submitted. Split the work into atomic worker tasks, normally at least one per plan step. If this is intentionally narrow, mention the exact step or include narrow-task-ok.` }],
-					isError: true,
-					details: { planSteps, workerTasks: workerTasks.length },
-				};
-			}
-			for (const task of inputTasks) {
-				const words = task.label.trim().split(/\s+/).filter(Boolean);
-				if (words.length > 3) {
-					return { content: [{ type: "text", text: `Task label too long: "${task.label}". Use 3 words or fewer.` }], isError: true };
-				}
-			}
-			let current = 0;
-			const progress: LeanTaskProgress[] = inputTasks.map((task) => ({ ...task, status: "queued", latest: "queued" }));
-			const details = (): LeanChainDetails => {
-				const usage = ctx.getContextUsage();
-				const usageText = usage?.tokens ? `${usage.tokens.toLocaleString()} / ${usage.contextWindow.toLocaleString()} (${usage.percent?.toFixed(0) ?? "?"}%)` : undefined;
-				const thinking = pi.getThinkingLevel();
-				if (progress[current]) {
-					progress[current].thinking = thinking;
-				}
-				return {
-					tasks: progress,
-					current,
-					statuses: progress.map((task) => task.status),
-					usage: usageText,
-					thinking,
-					currentTask: progress[current]?.task,
-					currentOutput: progress[current]?.output?.slice(-2000),
-				};
-			};
-			const plainSummary = () => {
-				const titleWidth = Math.max(...progress.map((task) => visibleWidth(`◦ ${task.label}`)));
-				return progress.map((task) => {
-					const icon = task.status === "running" ? "⠋" : task.status === "done" ? "✓" : task.status === "failed" ? "✗" : "◦";
-					const title = `${icon} ${task.label}`;
-					const left = truncateToWidth(title, titleWidth, "…", true);
-					if (task.status === "queued") return `${left} - ${queuedText(task)}`;
-					return `${left}${statusRail(task)} ${task.status}`;
-				}).join("\n");
-			};
-			const publish = () => {
-				onUpdate?.({ content: [{ type: "text", text: plainSummary() }], details: details() });
-			};
-			const outputs: string[] = [];
-			publish();
-			const runTask = async (i: number): Promise<{ index: number; code: number | null; output: string }> => {
-				const task = progress[i]!;
-				current = i;
-				task.status = "running";
-				task.latest = "starting";
-				task.phase = "starting";
-				task.startedAt = Date.now();
-				task.updatedAt = task.startedAt;
-				task.output = "";
-				publish();
-				const result = await runPiChild(ctx, task, ctx.model?.contextWindow, signal, (childProgress) => {
-					current = i;
-					Object.assign(task, childProgress);
-					task.updatedAt = Date.now();
-					task.output = task.output?.slice(-4000);
-					task.latest = task.latest?.slice(0, 160) || "working";
-					publish();
-				}).catch((error) => ({
-					code: 1,
-					output: error instanceof Error ? error.message : String(error),
-				}));
-				task.status = result.code === 0 ? "done" : "failed";
-				task.endedAt = Date.now();
-				task.updatedAt = task.endedAt;
-				task.output = result.output.slice(-4000);
-				task.latest = result.code === 0 ? "done" : `failed: exit ${result.code}`;
-				publish();
-				return { index: i, code: result.code, output: result.output };
-			};
-			for (let i = 0; i < progress.length;) {
-				const batch: number[] = [i];
-				if (progress[i]!.parallel) {
-					while (i + batch.length < progress.length && progress[i + batch.length]!.parallel) batch.push(i + batch.length);
-				}
-				current = batch[0]!;
-				const tick = setInterval(publish, 80);
-				const results = await Promise.all(batch.map((index) => runTask(index))).finally(() => clearInterval(tick));
-				results.sort((a, b) => a.index - b.index);
-				for (const result of results) {
-					const task = progress[result.index]!;
-					outputs.push(`\n## ${result.index + 1}. ${task.label} (${task.agent}, exit ${result.code})\n\n${result.output}`);
-				}
-				if (results.some((result) => result.code !== 0)) break;
-				i += batch.length;
-			}
-			return { content: [{ type: "text", text: "Lean chain complete." }], details: details() };
+			const publish = onUpdate ? (update: LeanChainUpdate) => onUpdate(update) : undefined;
+			return runLeanChain(ctx, params.tasks as LeanTask[], signal, publish);
 		},
 		renderCall(_args, _theme, _context) {
 			return new Text("", 0, 0);
 		},
 		renderResult(result, options, theme, _context) {
-			const d = result.details as LeanChainDetails | undefined;
-			return {
-				invalidate() {},
-				render(width: number) {
-					if (!d?.tasks?.length) return [];
-					const age = (task: LeanTaskProgress) => taskAge(task);
-					const runningFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-					const ctxFrames = ["◜", "◝", "◞", "◟"];
-					const frameIndex = Math.floor(Date.now() / 80);
-					const runningIcon = runningFrames[frameIndex % runningFrames.length]!;
-					const runningCtxIcon = ctxFrames[frameIndex % ctxFrames.length]!;
-					const titles = d.tasks.map((task, i) => {
-						const status = task.status ?? d.statuses?.[i] ?? "queued";
-						const icon = status === "running" ? runningIcon : status === "done" ? "◆" : status === "failed" ? "✖" : "◇";
-						return `${icon} ${task.label}`;
-					});
-					const activeRightWidth = Math.max(0, ...d.tasks.map((task, i) => {
-						const status = task.status ?? d.statuses?.[i] ?? "queued";
-						return status === "queued"
-							? visibleWidth(` - ${queuedText(task)}`)
-							: visibleWidth(statusRail(task, status === "running" ? runningCtxIcon : "/")) + visibleWidth(` ${status}`);
-					}));
-					const titleWidth = Math.min(Math.max(...titles.map(visibleWidth)), Math.max(0, width - activeRightWidth));
-					const lines: string[] = d.tasks.map((task, i) => {
-						const status = task.status ?? d.statuses?.[i] ?? "queued";
-						const color = status === "running" ? "accent" : status === "done" ? "success" : status === "failed" ? "error" : "borderAccent";
-						const title = titles[i]!;
-						const left = truncateToWidth(title, titleWidth, "…", true);
-						if (status === "queued") return theme.fg("dim", `${left} - ${queuedText(task)}`);
-						const railText = statusRail(task, status === "running" ? runningCtxIcon : "/");
-						const stateText = ` ${status}`;
-						return theme.fg(color, left) + theme.fg(color, railText) + theme.fg(color, stateText);
-					});
-					if (options.expanded) {
-						const task = d.tasks[d.current];
-						lines.push(theme.fg("borderMuted", "─".repeat(Math.min(width, 80))));
-						if (task) {
-							const meta = [formatUsage(task.usage), task.startedAt ? age(task) : undefined, task.thinking].filter(Boolean).join(" • ");
-							lines.push(theme.fg("accent", `${task.label}${meta ? ` (${meta})` : ""}`));
-						}
-						const output = task?.output ?? d.currentOutput;
-						lines.push(theme.fg("muted", "Feed:"));
-						if (output) lines.push(...output.split(/\r?\n/).slice(-16).map((line) => `  ${line}`));
-						else lines.push(theme.fg("dim", "  waiting for child event stream..."));
-						lines.push(theme.fg("dim", "Esc/Ctrl+C cancels."));
-					}
-					return lines.map((line) => truncateToWidth(line, width));
-				},
-			};
+			return leanChainComponent(result.details as LeanChainDetails | undefined, options, theme);
 		},
 	});
 
@@ -696,7 +829,78 @@ export default function leanFlow(pi: ExtensionAPI) {
 
 	pi.registerCommand("work", {
 		description: "Run atomic lean worker tasks from the current plan",
-		handler: async (args) => send(pi, `Execute lean work. Read .pi/lean-flow/plan.md if present. If the plan has multiple numbered implementation steps and the extra instruction is not explicitly limited to one step, create at least one worker task per step; never collapse a complicated plan into one broad worker. Do not print a separate task list; pass every needed worker task directly to lean_subagent_chain with labels of 3 words or fewer so the TUI displays them. Prefer one writer at a time; set parallel: true only for consecutive independent tasks expected not to touch the same files. Stop for human validation when automation cannot prove correctness. Do not use external subagent tools. Extra instruction:\n${args.trim() || "Implement the next approved chunk."}`),
+		handler: async (args, ctx) => {
+			if (activeWorkJob) {
+				ctx.ui.notify("/work already active", "error");
+				return;
+			}
+			const tasks = tasksFromPlan(ctx.cwd, args);
+			const controller = new AbortController();
+			const details = initialDetails(tasks);
+			activeWorkJob = { tasks, progress: details.tasks, details, controller, startedAt: Date.now() };
+			const renderWork = () => ctx.ui.setWidget("lean-work", (_tui, theme) => leanChainComponent(activeWorkJob?.details, { expanded: false }, theme), { placement: "aboveEditor" });
+			renderWork();
+			void runLeanChain(ctx, tasks, controller.signal, (update) => {
+				if (!activeWorkJob) return;
+				activeWorkJob.details = update.details;
+				activeWorkJob.progress = update.details.tasks;
+				renderWork();
+			}).then((result) => {
+				const progress = activeWorkJob?.progress ?? details.tasks;
+				const failed = Boolean(result.isError) || progress.some((task) => task.status === "failed");
+				if (controller.signal.aborted) {
+					ctx.ui.notify("/work cancelled", "warning");
+					sendWorkSummary(pi, workSummary("cancelled", progress));
+				} else if (failed) {
+					ctx.ui.notify("/work failed", "error");
+					sendWorkSummary(pi, workSummary("failed", progress, result.isError ? result.content?.[0]?.text : undefined));
+				} else {
+					ctx.ui.notify("/work complete", "info");
+					sendWorkSummary(pi, workSummary("complete", progress));
+				}
+			}).catch((error) => {
+				const progress = activeWorkJob?.progress ?? details.tasks;
+				if (controller.signal.aborted) {
+					ctx.ui.notify("/work cancelled", "warning");
+					sendWorkSummary(pi, workSummary("cancelled", progress));
+				} else {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`/work failed: ${message}`, "error");
+					sendWorkSummary(pi, workSummary("failed", progress, message));
+				}
+			}).finally(() => {
+				activeWorkJob = undefined;
+				ctx.ui.setWidget("lean-work", undefined);
+			});
+			ctx.ui.notify(`/work started ${tasks.length} task${tasks.length === 1 ? "" : "s"}`, "info");
+		},
+	});
+
+	pi.registerCommand("work-status", {
+		description: "Show one snapshot of the active background /work job",
+		handler: async (_args, ctx) => {
+			if (!activeWorkJob) {
+				ctx.ui.notify("No /work job running", "warning");
+				return;
+			}
+			sendWorkStatus(pi, formatWorkStatus(activeWorkJob));
+		},
+	});
+
+	pi.registerCommand("work-cancel", {
+		description: "Cancel the active background /work job",
+		handler: async (_args, ctx) => {
+			if (!activeWorkJob) {
+				ctx.ui.notify("No /work job running", "warning");
+				return;
+			}
+			if (activeWorkJob.controller.signal.aborted) {
+				ctx.ui.notify("/work cancellation already requested", "warning");
+				return;
+			}
+			activeWorkJob.controller.abort();
+			ctx.ui.notify("/work cancellation requested", "info");
+		},
 	});
 
 	pi.registerCommand("review", {
