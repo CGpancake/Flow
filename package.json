@@ -3,10 +3,18 @@
   "version": "1.0.0",
   "description": "Lean pi workflow extension: grill, plan, work/review subagents, handover, and issues.",
   "type": "module",
-  "keywords": ["pi-package", "pi-extension"],
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
   "license": "MIT",
   "pi": {
-    "extensions": [".pi/extensions"]
+    "extensions": [
+      ".pi/extensions"
+    ],
+    "skills": [
+      "skills"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
