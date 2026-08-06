@@ -9,8 +9,9 @@ import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth, visib
 import { mkdir, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { CONFIG_FILE as MAP_CONFIG_FILE } from "./map-tracker.ts";
 
-const LEAN_SYSTEM = `LEAN FLOW ACTIVE. CONCISE PONYTAIL-FULL BASELINE; DO NOT AUTO-LOAD SKILLS.
+const LEAN_SYSTEM_BASE = `LEAN FLOW ACTIVE. CONCISE PONYTAIL-FULL BASELINE; DO NOT AUTO-LOAD SKILLS.
 Permanent rules for the parent agent:
 - Ponytail full: understand and trace the real flow first, then stop at the first working rung: skip speculative work; reuse project code; stdlib; native platform; installed dependency; one line; minimum code.
 - Be lazy like a senior dev: the best code is code not written. YAGNI wins: delete before adding; no future-proof abstractions, boilerplate, scaffolding, factories, or one-implementation interfaces.
@@ -18,15 +19,28 @@ Permanent rules for the parent agent:
 - Preserve requested validation, data-loss prevention, security, accessibility, and error handling. Pick the edge-case-correct stdlib option; mark deliberate shortcut ceilings with a ponytail comment and upgrade path.
 - Keep modules feature/function focused and readable; split by reason-to-change, not type buckets; ~500-1000 lines is a warning, not a law.
 - Non-trivial modules should start with a short header: purpose, main entry points, and split trigger. When browsing, rg module headers first, then read matching files.
-- No long-term memory, lifecycle docs, ADRs, or issue tracker ceremony unless the user explicitly asks.
 - Non-trivial logic needs the smallest runnable check; trivial one-liners do not.
 - Output caveman-terse: code/actions first, then at most three short lines.
 - Use batched grill only when ambiguity changes implementation. Generate the whole question batch at once, then evaluate answers as a batch.
+- If context usage reaches about 50%, prepare a /handover and stop instead of compacting by default.`;
+
+// Single-session default: lean-flow owns subagents and bans tracker ceremony.
+// Division of labor with /map: /map planning repos (a MAP_CONFIG_FILE present in
+// cwd) are explicitly multi-session Wayfinder ceremony by design, so that half
+// of the baseline stands down there instead of fighting /map's own rules.
+const LEAN_SYSTEM_SINGLE_SESSION = `
+- No long-term memory, lifecycle docs, ADRs, or issue tracker ceremony unless the user explicitly asks.
 - For large chunks: grill -> short temporary plan -> pass the full atomic task list to lean_subagent_chain for TUI display -> worker chain -> fresh review -> human validation gate.
 - Lean-flow owns subagents. Use lean_subagent_chain, not external subagent tools/workflows.
 - Keep subagents lazy: worker for atomic write tasks, reviewer for read-only review. Use as many chain steps as needed; no arbitrary cap.
-- Subagent chain tasks must have descriptive labels in 3 words or fewer so the TUI shows what is happening.
-- If context usage reaches about 50%, prepare a /handover and stop instead of compacting by default.`;
+- Subagent chain tasks must have descriptive labels in 3 words or fewer so the TUI shows what is happening.`;
+
+const LEAN_SYSTEM_MAP_ACTIVE = `
+- This is a /map planning repo (multi-session Wayfinder ticket ceremony by design). Use map_read/map_create/map_update, not lean_subagent_chain/plan/work; the "no tracker ceremony" and "lean-flow owns subagents" rules do not apply here.`;
+
+function leanSystem(mapActive: boolean): string {
+	return `${LEAN_SYSTEM_BASE}${mapActive ? LEAN_SYSTEM_MAP_ACTIVE : LEAN_SYSTEM_SINGLE_SESSION}`;
+}
 
 const PONYTAIL_SKILL_PATH = join(getAgentDir(), "skills", "ponytail", "SKILL.md");
 
@@ -121,6 +135,11 @@ type LeanBackgroundJob = {
 
 const LEAN_JOB_MESSAGE = "lean-background-job";
 const PER_TASK_OUTPUT_CAP = 2_000;
+
+// Fixed model for worker/reviewer children, independent of whatever model the
+// parent session is on. Falls back to ctx.model if this model isn't resolvable
+// (e.g. no auth configured for openai-codex).
+const CHILD_MODEL = { provider: "openai-codex", id: "gpt-5.6-terra" };
 
 const AGENTS: Record<LeanTask["agent"], { tools: string; prompt: string }> = {
 	worker: {
@@ -276,12 +295,13 @@ async function runPiChild(ctx: ExtensionContext, task: LeanTask, contextWindow: 
 		appendSystemPromptOverride: () => [childPrompt],
 	});
 	await loader.reload();
+	const childModel = ctx.modelRegistry.find(CHILD_MODEL.provider, CHILD_MODEL.id) ?? ctx.model;
 	const { session } = await createAgentSession({
 		cwd: ctx.cwd,
 		agentDir,
 		settingsManager,
 		modelRegistry: ctx.modelRegistry,
-		model: ctx.model,
+		model: childModel,
 		tools: agent.tools.split(","),
 		resourceLoader: loader,
 		sessionManager: SessionManager.inMemory(ctx.cwd),
@@ -808,7 +828,8 @@ export default function leanFlow(pi: ExtensionAPI) {
 		const warning = usage?.percent !== null && usage?.percent !== undefined && usage.percent >= 50
 			? `\n\n[LEAN FLOW CONTEXT WARNING] Context is about ${usage.percent.toFixed(0)}%. Generate a /handover and stop unless the user explicitly wants to continue.`
 			: "";
-		return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${LEAN_SYSTEM}${warning}` };
+		const mapActive = existsSync(join(ctx.cwd, MAP_CONFIG_FILE));
+		return { systemPrompt: `${ctx.getSystemPrompt()}\n\n${leanSystem(mapActive)}${warning}` };
 	});
 
 	pi.on("tool_call", (event, ctx) => {
