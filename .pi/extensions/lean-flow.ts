@@ -125,12 +125,18 @@ type ActiveWorkJob = {
 	startedAt: number;
 };
 
+type LastWorkJob = {
+	status: "complete" | "cancelled" | "failed";
+	summary: string;
+	details: LeanChainDetails;
+	finishedAt: number;
+};
+
 type LeanBackgroundJob = {
 	id: string;
 	controller: AbortController;
 	details: LeanChainDetails;
 	startedAt: number;
-	lastProgressAt: number;
 };
 
 const LEAN_JOB_MESSAGE = "lean-background-job";
@@ -528,8 +534,12 @@ function stripPlanParallelMarker(text: string): string {
 	return text.replace(/\s\[parallel(?::[^\]]+)?\]\s*$/i, "").trim();
 }
 
+const LABEL_STOPWORDS = new Set(["the", "a", "an", "to", "for", "of", "in", "on", "and", "or", "with", "is", "are", "this", "that", "from", "as", "at", "by"]);
+
 function taskLabel(text: string): string {
-	return stripPlanParallelMarker(text).replace(/[`*_#>[\]()]/g, " ").trim().split(/\s+/).filter(Boolean).slice(0, 3).join(" ") || "Lean work";
+	const words = stripPlanParallelMarker(text).replace(/[`*_#>[\]()]/g, " ").trim().split(/\s+/).filter(Boolean).map((word) => word.replace(/[:;,.]+$/, ""));
+	const meaningful = words.filter((word) => !LABEL_STOPWORDS.has(word.toLowerCase()));
+	return (meaningful.length ? meaningful : words).slice(0, 5).join(" ") || "Lean work";
 }
 
 function planStepParallel(body: string): boolean {
@@ -571,13 +581,12 @@ function boundedDetails(details: LeanChainDetails): LeanChainDetails {
 	return { ...details, tasks, statuses: tasks.map((task) => task.status), currentOutput: details.currentOutput?.slice(-PER_TASK_OUTPUT_CAP) };
 }
 
-function jobMessage(job: LeanBackgroundJob, state: "started" | "progress" | "complete" | "failed"): { content: string; details: { jobId: string; state: string; elapsed: string; chain: LeanChainDetails } } {
+function jobMessage(job: LeanBackgroundJob, state: "complete" | "failed"): { content: string; details: { jobId: string; state: string; elapsed: string; chain: LeanChainDetails } } {
 	const chain = boundedDetails(job.details);
-	const current = chain.tasks[chain.current];
-	const task = current ? ` · ${current.label}: ${current.status}` : "";
+	const elapsed = compactDuration(Date.now() - job.startedAt);
 	return {
-		content: `Lean job ${job.id} ${state}${task}`,
-		details: { jobId: job.id, state, elapsed: compactDuration(Date.now() - job.startedAt), chain },
+		content: `Lean job ${job.id} ${chainSummary(state, chain.tasks)} (${elapsed})`,
+		details: { jobId: job.id, state, elapsed, chain },
 	};
 }
 
@@ -597,52 +606,40 @@ function latestWorkLine(tasks: LeanTaskProgress[]): string | undefined {
 		?? [...tasks].reverse().find((task) => task.latest)?.latest;
 }
 
-function formatWorkStatus(activeWorkJob: ActiveWorkJob | undefined, options: { feedTail?: boolean | number } = {}): string {
-	if (!activeWorkJob) return "/work idle";
-	const elapsed = compactDuration(Date.now() - activeWorkJob.startedAt);
-	const feedTailLines = typeof options.feedTail === "number" ? Math.max(0, options.feedTail) : options.feedTail ? 8 : 0;
-	const lines = [`/work active ${elapsed}`];
-	for (const task of activeWorkJob.progress) {
-		const usage = task.usage;
-		const ctx = contextPercent(usage);
-		const ctxTokens = usage?.contextTokens ? formatTokens(usage.contextTokens) : "--";
-		const input = usage?.input ? formatTokens(usage.input) : "--";
-		const output = usage?.output ? formatTokens(usage.output) : "--";
-		lines.push(`- ${task.label}: ${task.status} ctx ${ctx} ${ctxTokens} in ${input} out ${output}`);
-	}
-	const latest = latestWorkLine(activeWorkJob.progress);
-	if (latest) lines.push(`latest: ${latest}`);
-	if (feedTailLines > 0) {
-		const feed = activeWorkJob.progress
-			.filter((task) => task.status === "running" && task.output)
-			.flatMap((task) => task.output!.split(/\r?\n/).filter(Boolean).map((line) => `${task.label}: ${line}`))
-			.slice(-feedTailLines);
-		if (feed.length) lines.push("feed:", ...feed.map((line) => `  ${line}`));
-	}
-	return lines.join("\n");
-}
-
-function workSummary(status: "complete" | "cancelled" | "failed", tasks: LeanTaskProgress[], reason?: string): string {
-	const counts = tasks.reduce<Record<LeanTaskProgress["status"], number>>((acc, task) => {
+function taskCounts(tasks: LeanTaskProgress[]): Record<LeanTaskProgress["status"], number> {
+	return tasks.reduce<Record<LeanTaskProgress["status"], number>>((acc, task) => {
 		acc[task.status]++;
 		return acc;
 	}, { queued: 0, running: 0, done: 0, failed: 0, cancelled: 0 });
-	const failed = tasks.filter((task) => task.status === "failed").map((task) => task.label).slice(0, 2).join(", ");
-	const suffix = reason ? `: ${reason.split(/\r?\n/)[0]?.slice(0, 160)}` : failed ? `: ${failed}` : "";
-	return `/work ${status}: ${counts.done} done, ${counts.failed} failed, ${counts.cancelled} cancelled, ${counts.running + counts.queued} pending${suffix}`;
 }
 
-function sendWorkSummary(pi: ExtensionAPI, summary: string, details: LeanChainDetails): void {
+function chainSummary(status: "complete" | "cancelled" | "failed", tasks: LeanTaskProgress[], reason?: string): string {
+	const counts = taskCounts(tasks);
+	const failed = tasks.filter((task) => task.status === "failed").map((task) => task.label).slice(0, 2).join(", ");
+	const suffix = reason ? `: ${reason.split(/\r?\n/)[0]?.slice(0, 160)}` : failed ? `: ${failed}` : "";
+	return `${status}: ${counts.done} done, ${counts.failed} failed, ${counts.cancelled} cancelled, ${counts.running + counts.queued} pending${suffix}`;
+}
+
+// On-demand /work-status snapshot: distinguishes running vs queued (chainSummary lumps them
+// as "pending" since that distinction stops mattering once a chain is finished).
+function activeSummary(activeWorkJob: ActiveWorkJob): string {
+	const elapsed = compactDuration(Date.now() - activeWorkJob.startedAt);
+	const counts = taskCounts(activeWorkJob.progress);
+	const latest = latestWorkLine(activeWorkJob.progress);
+	return `active ${elapsed}: ${counts.done} done, ${counts.running} running, ${counts.queued} queued, ${counts.failed} failed${latest ? ` — ${latest}` : ""}`;
+}
+
+function sendWorkSummary(pi: ExtensionAPI, status: "complete" | "cancelled" | "failed", summary: string, details: LeanChainDetails): void {
 	pi.sendMessage({
 		customType: "lean-work-summary",
 		content: summary,
 		display: true,
-		details: { status: summary.includes(" cancelled:") ? "cancelled" : summary.includes(" failed:") ? "failed" : "complete", chain: boundedDetails(details) },
+		details: { status, chain: boundedDetails(details) },
 	}, { deliverAs: "followUp" });
 }
 
-function sendWorkStatus(pi: ExtensionAPI, status: string): void {
-	pi.sendMessage({ customType: "lean-work-status", content: status, display: true }, { deliverAs: "followUp" });
+function sendWorkStatus(pi: ExtensionAPI, summary: string, details: LeanChainDetails): void {
+	pi.sendMessage({ customType: "lean-work-status", content: summary, display: true, details: { chain: boundedDetails(details) } }, { deliverAs: "followUp" });
 }
 
 function resolvedToolPath(cwd: string, path: string): string {
@@ -651,6 +648,7 @@ function resolvedToolPath(cwd: string, path: string): string {
 
 export default function leanFlow(pi: ExtensionAPI) {
 	let activeWorkJob: ActiveWorkJob | undefined;
+	let lastWorkJob: LastWorkJob | undefined;
 	const backgroundJobs = new Map<string, LeanBackgroundJob>();
 	const ownedPaths = new Map<string, Set<LeanTaskProgress>>();
 	let nextBackgroundJob = 1;
@@ -668,21 +666,25 @@ export default function leanFlow(pi: ExtensionAPI) {
 	};
 	pi.registerMessageRenderer(LEAN_JOB_MESSAGE, (message, options, theme) => {
 		const details = message.details as { jobId?: string; state?: string; elapsed?: string; chain?: LeanChainDetails } | undefined;
-		const header = theme.fg("toolTitle", `Lean job ${details?.jobId ?? "?"} ${details?.state ?? "update"} · ${details?.elapsed ?? "--:--"}`);
+		const header = theme.fg(details?.state === "failed" ? "error" : "toolTitle", String(message.content));
 		const chain = leanChainComponent(details?.chain, options, theme);
 		return new Text([header, ...chain.render(100)].join("\n"), options.outputPad, 0);
 	});
 	pi.registerMessageRenderer("lean-work-summary", (message, options, theme) => {
 		const details = message.details as { status?: string; chain?: LeanChainDetails } | undefined;
-		const state = details?.status === "cancelled" || details?.status === "failed"
-			? theme.fg("error", details.status.toUpperCase())
-			: "complete";
+		const header = theme.fg(details?.status === "cancelled" || details?.status === "failed" ? "error" : "toolTitle", String(message.content));
 		const chain = leanChainComponent(details?.chain, options, theme);
-		return new Text([theme.fg("toolTitle", `/work ${state}`), ...chain.render(100)].join("\n"), options.outputPad, 0);
+		return new Text([header, ...chain.render(100)].join("\n"), options.outputPad, 0);
+	});
+	pi.registerMessageRenderer("lean-work-status", (message, options, theme) => {
+		const details = message.details as { chain?: LeanChainDetails } | undefined;
+		const header = theme.fg("toolTitle", String(message.content));
+		const chain = leanChainComponent(details?.chain, { expanded: true }, theme);
+		return new Text([header, ...chain.render(100)].join("\n"), options.outputPad, 0);
 	});
 	const renderActiveWork = (ctx: ExtensionContext) => ctx.ui.setWidget("lean-work", (_tui, theme) => leanChainComponent(activeWorkJob?.details, { expanded: false }, theme), { placement: "aboveEditor" });
 
-	const runLeanChain = async (ctx: ExtensionContext, inputTasks: LeanTask[], signal?: AbortSignal, publish?: (update: LeanChainUpdate) => void): Promise<LeanChainResult> => {
+	const runLeanChain = async (ctx: ExtensionContext, inputTasks: LeanTask[], signal?: AbortSignal, publish?: (update: LeanChainUpdate) => void, options: { checkLabelWords?: boolean } = {}): Promise<LeanChainResult> => {
 		if (inputTasks.length === 0) return { content: [{ type: "text" as const, text: "No lean subagent tasks." }] };
 		const workerTasks = inputTasks.filter((task) => task.agent === "worker");
 		const planSteps = leanPlanStepCount(ctx.cwd);
@@ -693,10 +695,15 @@ export default function leanFlow(pi: ExtensionAPI) {
 				details: { planSteps, workerTasks: workerTasks.length },
 			};
 		}
-		for (const task of inputTasks) {
-			const words = task.label.trim().split(/\s+/).filter(Boolean);
-			if (words.length > 3) {
-				return { content: [{ type: "text" as const, text: `Task label too long: "${task.label}". Use 3 words or fewer.` }], isError: true };
+		// checkLabelWords keeps the LLM-authored tool path terse (it can reason about a good
+		// 3-word label); /work's mechanically-sliced plan labels get more words instead, since a
+		// dumb slice at 3 words often drops the one word that made the label comprehensible.
+		if (options.checkLabelWords !== false) {
+			for (const task of inputTasks) {
+				const words = task.label.trim().split(/\s+/).filter(Boolean);
+				if (words.length > 3) {
+					return { content: [{ type: "text" as const, text: `Task label too long: "${task.label}". Use 3 words or fewer.` }], isError: true };
+				}
 			}
 		}
 		let current = 0;
@@ -915,13 +922,16 @@ export default function leanFlow(pi: ExtensionAPI) {
 						set focused(value: boolean) { focused = value; editor.focused = value; },
 						invalidate: () => { cached = undefined; editor.invalidate(); },
 						handleInput(data: string) {
+							// Up/down and tab/shift+tab, not shift+arrow: many terminal emulators
+							// intercept shift+arrow for their own native text selection and never
+							// forward it to the app, so that binding silently did nothing.
 							const opts = optionsFor(questions[qIndex]!);
-							if (matchesKey(data, Key.shift("left"))) { changeQuestion(Math.max(0, qIndex - 1)); return; }
-							if (matchesKey(data, Key.shift("right"))) { changeQuestion(Math.min(questions.length - 1, qIndex + 1)); return; }
+							if (matchesKey(data, Key.shift("tab"))) { changeQuestion(Math.max(0, qIndex - 1)); return; }
+							if (matchesKey(data, Key.tab)) { changeQuestion(Math.min(questions.length - 1, qIndex + 1)); return; }
 							if (matchesKey(data, Key.escape)) { done(null); return; }
 							if (matchesKey(data, Key.enter)) { commitCurrent(); return; }
-							if (matchesKey(data, Key.shift("up"))) { optionIndex = Math.max(0, optionIndex - 1); refresh(); return; }
-							if (matchesKey(data, Key.shift("down"))) { optionIndex = Math.min(opts.length - 1, optionIndex + 1); refresh(); return; }
+							if (matchesKey(data, Key.up)) { optionIndex = Math.max(0, optionIndex - 1); refresh(); return; }
+							if (matchesKey(data, Key.down)) { optionIndex = Math.min(opts.length - 1, optionIndex + 1); refresh(); return; }
 							editor.handleInput(data);
 							refresh();
 						},
@@ -951,7 +961,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 							addWrapped(theme.fg("muted", " Notes/comment:"));
 							for (const line of editor.render(Math.max(1, renderWidth - 2))) lines.push(` ${line}`);
 							lines.push("");
-							addWrapped(theme.fg("dim", " arrows edit notes • Shift+↑/↓ choose • Shift+←/→ questions • Enter next/finish • Esc cancels"));
+							addWrapped(theme.fg("dim", " ←/→ edit notes • ↑/↓ choose • Tab/Shift+Tab questions • Enter next/finish • Esc cancels"));
 							lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 							cached = lines;
 							return lines;
@@ -1017,27 +1027,29 @@ export default function leanFlow(pi: ExtensionAPI) {
 				controller: new AbortController(),
 				details: initialDetails(params.tasks as LeanTask[]),
 				startedAt: Date.now(),
-				lastProgressAt: 0,
 			};
 			backgroundJobs.set(id, job);
-			const emit = (state: "started" | "progress" | "complete" | "failed") => {
+			// Progress lives in a widget (redrawn in place, per-UPS via runLeanChain's tick) so
+			// it never touches chat/context. Only the final complete/failed state gets a message.
+			const widgetKey = `lean-job-${id}`;
+			const renderJob = () => ctx.ui.setWidget(widgetKey, (_tui, theme) => leanChainComponent(job.details, { expanded: false }, theme), { placement: "aboveEditor" });
+			const finish = (state: "complete" | "failed") => {
+				ctx.ui.setWidget(widgetKey, undefined);
 				const message = jobMessage(job, state);
 				pi.sendMessage({ customType: LEAN_JOB_MESSAGE, content: message.content, display: true, details: message.details }, { deliverAs: "steer", triggerTurn: false });
 			};
-			emit("started");
+			renderJob();
 			void runLeanChain(ctx, params.tasks as LeanTask[], job.controller.signal, (update) => {
 				job.details = boundedDetails(update.details);
-				if (Date.now() - job.lastProgressAt < 500) return;
-				job.lastProgressAt = Date.now();
-				emit("progress");
+				renderJob();
 			}).then((result) => {
 				const details = result.details as LeanChainDetails | undefined;
 				if (Array.isArray(details?.tasks)) job.details = boundedDetails(details);
-				emit(result.isError ? "failed" : "complete");
+				finish(result.isError ? "failed" : "complete");
 			}).catch((error) => {
 				const task = job.details.tasks[job.details.current];
 				if (task) { task.status = "failed"; task.latest = error instanceof Error ? error.message : String(error); }
-				emit("failed");
+				finish("failed");
 			}).finally(() => backgroundJobs.delete(id));
 			return { content: [{ type: "text", text: `Started lean background job ${id}.` }], details: { jobId: id } };
 		},
@@ -1085,6 +1097,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 			const controller = new AbortController();
 			const details = initialDetails(tasks);
 			activeWorkJob = { tasks, progress: details.tasks, details, controller, startedAt: Date.now() };
+			lastWorkJob = undefined;
 			const renderWork = () => renderActiveWork(ctx);
 			renderWork();
 			void runLeanChain(ctx, tasks, controller.signal, (update) => {
@@ -1092,33 +1105,27 @@ export default function leanFlow(pi: ExtensionAPI) {
 				activeWorkJob.details = update.details;
 				activeWorkJob.progress = update.details.tasks;
 				renderWork();
-			}).then((result) => {
+			}, { checkLabelWords: false }).then((result) => {
 				const job = activeWorkJob;
 				const progress = job?.progress ?? details.tasks;
 				const finalDetails = job?.details ?? { tasks: progress, current: 0, statuses: progress.map((task) => task.status) };
 				const failed = Boolean(result.isError) || progress.some((task) => task.status === "failed");
-				if (controller.signal.aborted) {
-					ctx.ui.notify("/work cancelled", "warning");
-					sendWorkSummary(pi, workSummary("cancelled", progress), finalDetails);
-				} else if (failed) {
-					ctx.ui.notify("/work failed", "error");
-					sendWorkSummary(pi, workSummary("failed", progress, result.isError ? result.content?.[0]?.text : undefined), finalDetails);
-				} else {
-					ctx.ui.notify("/work complete", "info");
-					sendWorkSummary(pi, workSummary("complete", progress), finalDetails);
-				}
+				const status = controller.signal.aborted ? "cancelled" : failed ? "failed" : "complete";
+				const reason = status === "failed" && result.isError ? result.content?.[0]?.text : undefined;
+				const summary = `/work ${chainSummary(status, progress, reason)}`;
+				ctx.ui.notify(summary, status === "complete" ? "info" : status === "cancelled" ? "warning" : "error");
+				sendWorkSummary(pi, status, summary, finalDetails);
+				lastWorkJob = { status, summary, details: finalDetails, finishedAt: Date.now() };
 			}).catch((error) => {
 				const job = activeWorkJob;
 				const progress = job?.progress ?? details.tasks;
 				const finalDetails = job?.details ?? { tasks: progress, current: 0, statuses: progress.map((task) => task.status) };
-				if (controller.signal.aborted) {
-					ctx.ui.notify("/work cancelled", "warning");
-					sendWorkSummary(pi, workSummary("cancelled", progress), finalDetails);
-				} else {
-					const message = error instanceof Error ? error.message : String(error);
-					ctx.ui.notify(`/work failed: ${message}`, "error");
-					sendWorkSummary(pi, workSummary("failed", progress, message), finalDetails);
-				}
+				const status = controller.signal.aborted ? "cancelled" : "failed";
+				const reason = status === "failed" ? (error instanceof Error ? error.message : String(error)) : undefined;
+				const summary = `/work ${chainSummary(status, progress, reason)}`;
+				ctx.ui.notify(summary, status === "cancelled" ? "warning" : "error");
+				sendWorkSummary(pi, status, summary, finalDetails);
+				lastWorkJob = { status, summary, details: finalDetails, finishedAt: Date.now() };
 			}).finally(() => {
 				activeWorkJob = undefined;
 				ctx.ui.setWidget("lean-work", undefined);
@@ -1128,13 +1135,18 @@ export default function leanFlow(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("work-status", {
-		description: "Show one snapshot of the active background /work job",
+		description: "Show one snapshot of the active /work job, or a summary of the last finished chain",
 		handler: async (_args, ctx) => {
-			if (!activeWorkJob) {
-				ctx.ui.notify("No /work job running", "warning");
+			if (activeWorkJob) {
+				sendWorkStatus(pi, `/work ${activeSummary(activeWorkJob)}`, activeWorkJob.details);
 				return;
 			}
-			sendWorkStatus(pi, formatWorkStatus(activeWorkJob));
+			if (lastWorkJob) {
+				const elapsed = compactDuration(Date.now() - lastWorkJob.finishedAt);
+				sendWorkStatus(pi, `${lastWorkJob.summary} (finished ${elapsed} ago)`, lastWorkJob.details);
+				return;
+			}
+			ctx.ui.notify("No /work job running", "warning");
 		},
 	});
 
