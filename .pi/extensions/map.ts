@@ -2,14 +2,13 @@
 // Entry points: /map, map_read/map_create/map_update, and edit/write interception.
 // Split only if command UI or tool schemas grow beyond the tracker workflow.
 
-import { realpath, readdir } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	CONFIG_FILE,
-	MAPS_DIR,
 	addOutOfScope,
 	checkCompletion,
 	claimTicket,
@@ -18,6 +17,7 @@ import {
 	frontier,
 	initConfig,
 	isInsidePath,
+	listEfforts,
 	listTickets,
 	markOutOfScope,
 	readConfig,
@@ -56,16 +56,6 @@ function cleanRequired(value: string | undefined, label: string): string {
 function numberRequired(value: number | undefined): number {
 	if (!Number.isInteger(value) || value! < 1) throw new Error("A positive ticket number is required");
 	return value!;
-}
-
-async function listEfforts(root: string): Promise<string[]> {
-	try {
-		const entries = await readdir(resolve(root, MAPS_DIR), { withFileTypes: true });
-		return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
-	} catch (error: any) {
-		if (error?.code === "ENOENT") return [];
-		throw error;
-	}
 }
 
 async function effortStatus(root: string, effort: string): Promise<EffortStatus> {

@@ -172,6 +172,16 @@ export function issuesPath(root: string, effort: string): string {
 	return join(effortPath(root, effort), "issues");
 }
 
+export async function listEfforts(root: string): Promise<string[]> {
+	try {
+		const entries = await readdir(resolve(root, MAPS_DIR), { withFileTypes: true });
+		return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+	} catch (error: any) {
+		if (error?.code === "ENOENT") return [];
+		throw error;
+	}
+}
+
 export function slugify(value: string): string {
 	return value
 		.normalize("NFKD")
