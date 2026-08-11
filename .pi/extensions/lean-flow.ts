@@ -504,7 +504,7 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 			const titleWidth = Math.min(Math.max(...titles.map(visibleWidth)), Math.max(0, width - activeRightWidth));
 			const lines: string[] = d.tasks.map((task, i) => {
 				const status = task.status ?? d.statuses?.[i] ?? "queued";
-				const color = status === "running" ? "accent" : status === "done" ? "success" : status === "failed" || status === "cancelled" ? "error" : "borderAccent";
+				const color = status === "running" ? "warning" : status === "done" ? "success" : status === "failed" || status === "cancelled" ? "error" : "borderAccent";
 				const title = titles[i]!;
 				const left = truncateToWidth(title, titleWidth, "…", true);
 				if (status === "queued") return theme.fg("dim", `${left} - ${queuedText(task)}`);

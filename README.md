@@ -19,6 +19,8 @@ Project-local copy layout:
 .pi/extensions/map.ts
 .pi/extensions/map-tracker.ts
 skills/engineering/project-map/SKILL.md
+.claude/skills/map/SKILL.md
+.claude/skills/map_plan/SKILL.md
 ```
 
 `/map` keeps planning state in a dedicated repository and treats its configured target repository as read-only. The package includes its tracker, tools, workflow skill, prototype support, tests, and upstream MIT attribution; no Crucible files are required.
