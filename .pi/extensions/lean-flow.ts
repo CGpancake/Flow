@@ -24,6 +24,7 @@ import {
 	planStepCount,
 	planStepsFromText,
 	planTrack,
+	parseTicketFilters,
 	pathRefs,
 	readTracksTree,
 	restoreTicket,
@@ -592,8 +593,8 @@ function planAddPrompt(current: string, scope: string): string {
 
 async function startPlan(pi: ExtensionAPI, ctx: ExtensionContext, input: string): Promise<void> {
 	const { filters, rest } = parseTicketFilters(input);
-	const guidance = rest.join(" ");
-	const hasFilter = Boolean(filters.track || filters.type || filters.status || filters.idPrefix);
+	let guidance = rest.join(" ");
+	let hasFilter = Boolean(filters.track || filters.type || filters.status || filters.idPrefix);
 	if (!hasFilter) {
 		send(pi, planPrompt(guidance || "Use the current conversation goal."));
 		return;
@@ -602,14 +603,15 @@ async function startPlan(pi: ExtensionAPI, ctx: ExtensionContext, input: string)
 	const tree = readTracksTree(rootDir);
 	const track = filters.track ? findTrack(tree, filters.track) : undefined;
 	if (filters.track && !track) {
-		await unknownTrack(ctx, filters.track);
-		return;
+		guidance = [guidance, `track ${filters.track}`].filter(Boolean).join(" ");
+		delete filters.track;
+		hasFilter = Boolean(filters.type || filters.status || filters.idPrefix);
+		if (!hasFilter) {
+			send(pi, planPrompt(guidance));
+			return;
+		}
 	}
 	if (track) filters.track = track.path;
-	if ((filters.type && !TICKET_TYPES.includes(filters.type)) || (filters.status && !TICKET_STATUSES.includes(filters.status))) {
-		notifyPlanFilter(ctx, filters, tree);
-		return;
-	}
 	const includeClosed = filters.status === "done";
 	const matches = filterTickets(tree, filters).filter((ticket) => includeClosed || (ticket.status !== "done" && ticket.path.split("/")[0] !== ARCHIVE_DIR));
 	if (!matches.length) {
@@ -1103,7 +1105,6 @@ function resolvedToolPath(cwd: string, path: string): string {
 }
 
 const TICKET_TYPES: TicketType[] = ["bug", "feature", "rnd"];
-const TICKET_STATUSES: TicketStatus[] = ["todo", "started", "done"];
 
 function openTypeCounts(node: TrackNode): string {
 	const counts: Record<TicketType, number> = { bug: 0, feature: 0, rnd: 0 };
@@ -1127,36 +1128,6 @@ function findTicket(tree: TrackNode, id: string): Ticket | undefined {
 	if (!needle) return undefined;
 	const tickets = filterTickets(tree, { idPrefix: needle });
 	return tickets.find((ticket) => ticket.id.toLowerCase() === needle) ?? (tickets.length === 1 ? tickets[0] : undefined);
-}
-
-function parseTicketFilters(input: string): { filters: TicketFilters; rest: string[] } {
-	const tokens = input.split(/\s+/).filter(Boolean);
-	const filters: TicketFilters = {};
-	const rest: string[] = [];
-	for (let i = 0; i < tokens.length; i++) {
-		const token = tokens[i]!;
-		const pair = token.match(/^(track|type|status):(.+)$/i);
-		if (pair) {
-			if (pair[1]!.toLowerCase() === "track") filters.track = pair[2]!;
-			else if (pair[1]!.toLowerCase() === "type") filters.type = pair[2]!.toLowerCase() as TicketType;
-			else filters.status = pair[2]!.toLowerCase() as TicketStatus;
-			continue;
-		}
-		const key = token.toLowerCase();
-		if ((key === "track" || key === "type" || key === "status") && tokens[i + 1]) {
-			const value = tokens[++i]!;
-			if (key === "track") filters.track = value;
-			else if (key === "type") filters.type = value.toLowerCase() as TicketType;
-			else filters.status = value.toLowerCase() as TicketStatus;
-			continue;
-		}
-		if (token.startsWith("#") && token.length > 1) {
-			filters.idPrefix = token.slice(1);
-			continue;
-		}
-		rest.push(token);
-	}
-	return { filters, rest };
 }
 
 // Only an explicit leading `--track <path>` / `track <path>` names the ticket track, so title words never become a track.

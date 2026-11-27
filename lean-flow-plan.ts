@@ -1,6 +1,6 @@
 // Pure lean-flow helpers: plan/run parsing plus tracks-tree and ticket file IO. Entry points are
 // plan/run (tasksFromPlanText, branchSlug, reviewVerdict) and tracks/tickets (parseTracks,
-// parseTicketFile, readTracksTree, filterTickets, archive/restore/migrate ticket). No Pi imports so
+// parseTicketFile, readTracksTree, parseTicketFilters, filterTickets, archive/restore/migrate ticket). No Pi imports so
 // tests/*.test.ts run under plain `node --test`. Split trigger: move ticket read/write/archive/migrate
 // into lean-flow-tickets.ts once ticket IO outgrows parsing.
 
@@ -232,6 +232,7 @@ export type Ticket = {
 export type TrackNode = { name: string; path: string; children: TrackNode[]; issues: Ticket[] };
 
 const MIGRATED_STATUS: Record<TrackStatus, TicketStatus> = { pending: "todo", started: "started", completed: "done" };
+const MIGRATED_MARKER = ".migrated";
 const TICKET_FILE = /^(bug|feature|rnd)-([0-9a-f]{6})-(.*)\.md$/i;
 
 function baseName(path: string): string {
@@ -341,6 +342,54 @@ export function readTracksTree(root: string): TrackNode {
 }
 
 export type TicketFilters = { track?: string; type?: TicketType; status?: TicketStatus; idPrefix?: string };
+
+const TICKET_TYPES: TicketType[] = ["bug", "feature", "rnd"];
+const TICKET_STATUSES: TicketStatus[] = ["todo", "started", "done"];
+
+// Space-separated filters only lift a token when its value validates, so prose like `type:location`
+// stays in the guidance text instead of aborting the plan.
+export function parseTicketFilters(input: string): { filters: TicketFilters; rest: string[] } {
+	const tokens = input.split(/\s+/).filter(Boolean);
+	const filters: TicketFilters = {};
+	const rest: string[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		const pair = token.match(/^(track|type|status):(.+)$/i);
+		if (pair) {
+			const key = pair[1]!.toLowerCase();
+			const value = pair[2]!;
+			const lower = value.toLowerCase();
+			if (key === "track") filters.track = value;
+			else if (key === "type" && TICKET_TYPES.includes(lower as TicketType)) filters.type = lower as TicketType;
+			else if (key === "status" && TICKET_STATUSES.includes(lower as TicketStatus)) filters.status = lower as TicketStatus;
+			else {
+				rest.push(token);
+				continue;
+			}
+			continue;
+		}
+		const key = token.toLowerCase();
+		if ((key === "track" || key === "type" || key === "status") && tokens[i + 1]) {
+			const value = tokens[i + 1]!;
+			const lower = value.toLowerCase();
+			if (key === "track") filters.track = value;
+			else if (key === "type" && TICKET_TYPES.includes(lower as TicketType)) filters.type = lower as TicketType;
+			else if (key === "status" && TICKET_STATUSES.includes(lower as TicketStatus)) filters.status = lower as TicketStatus;
+			else {
+				rest.push(token);
+				continue;
+			}
+			i++;
+			continue;
+		}
+		if (token.startsWith("#") && token.length > 1) {
+			filters.idPrefix = token.slice(1);
+			continue;
+		}
+		rest.push(token);
+	}
+	return { filters, rest };
+}
 
 function walkTickets(node: TrackNode, visit: (ticket: Ticket) => void): void {
 	for (const ticket of node.issues) visit(ticket);
@@ -466,13 +515,16 @@ async function moveRootTickets(root: string, used: Set<string>): Promise<boolean
 
 // Additive `tracks.md` merge: existing tickets are keyed by track path plus title, so only
 // missing ledger issues are written with minted typed filenames. Returns how many were added,
-// so a repeat run returns 0. Also renames legacy `<slug>.md` tickets and moves root tickets to
-// inbox/. Never deletes `tracks.md` (humans compare first).
+// so a repeat run returns 0. A `.migrated` marker inside tracksDir skips later ledger imports,
+// so tickets deleted after the first import stay deleted. Also renames legacy `<slug>.md`
+// tickets and moves root tickets to inbox/. Never deletes `tracks.md` (humans compare first).
 export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<number> {
 	const tree = readTracksTree(tracksDir);
 	const used = ticketIds(tree);
 	await moveRootTickets(tracksDir, used);
 	await renameLegacyTickets(tracksDir, used);
+	const marker = join(tracksDir, MIGRATED_MARKER);
+	if (existsSync(marker)) return 0;
 	if (!existsSync(tracksMdPath)) return 0;
 	const tracks = parseTracks(readFileSync(tracksMdPath, "utf8"));
 	const existing = new Set<string>();
@@ -492,6 +544,8 @@ export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): 
 			added += 1;
 		}
 	}
+	await mkdir(tracksDir, { recursive: true });
+	await writeFile(marker, "", "utf8");
 	return added;
 }
 

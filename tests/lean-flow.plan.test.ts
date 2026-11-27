@@ -16,6 +16,7 @@ import {
 	migrateTracksMd,
 	mintTicketId,
 	parseTicketFile,
+	parseTicketFilters,
 	parseTracks,
 	pathRefs,
 	planGoal,
@@ -382,6 +383,15 @@ test("rewriteTicketStatus keeps extra frontmatter keys, CRLF, and body bytes", (
 	assert.equal(rewriteTicketStatus("# A\n", "todo"), "---\nstatus: todo\n---\n# A\n");
 });
 
+test("parseTicketFilters lifts only validated values and leaves the rest as guidance", () => {
+	assert.deepEqual(parseTicketFilters("track area type:bug status started #abc release notes"), {
+		filters: { track: "area", type: "bug", status: "started", idPrefix: "abc" },
+		rest: ["release", "notes"],
+	});
+	assert.deepEqual(parseTicketFilters("type:bug"), { filters: { type: "bug" }, rest: [] });
+	assert.deepEqual(parseTicketFilters("type:location status nearby"), { filters: {}, rest: ["type:location", "status", "nearby"] });
+});
+
 test("filterTickets combines track prefixes with type, status, and id prefixes", () => {
 	const ticket = (path: string, title: string, status: "todo" | "started" | "done") => parseTicketFile(`---\nstatus: ${status}\n---\n\n# ${title}\n`, path, path.split("/").slice(0, -1).join("/"));
 	const tree = {
@@ -490,6 +500,25 @@ test("migrateTracksMd writes folders and issue files with detail", async () => {
 		assert.match(issues.get("Add test")!.path, /^widget-api\/feature-[0-9a-f]{6}-add-test\.md$/);
 		assert.match(issues.get("Ship docs")!.path, /^widget-api\/feature-[0-9a-f]{6}-ship-docs\.md$/);
 		assert.match(readFileSync(join(tracksDir, issues.get("Add route")!.path), "utf8"), /^---\nstatus: todo\ntype: feature\n---\n\n# Add route\n\nRoute detail line\.\nSecond route line\.\n$/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("migrateTracksMd skips the ledger once the .migrated marker exists", async () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-marker-"));
+	try {
+		const tracksMd = join(root, "tracks.md");
+		const tracksDir = join(root, ".pi", "tracks");
+		writeFileSync(tracksMd, `## widget-api\n\n- [ ] Keep me\n- [ ] Delete me\n`);
+
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 2);
+		assert.ok(existsSync(join(tracksDir, ".migrated")), "a completed import writes the marker");
+		rmSync(join(tracksDir, "widget-api"), { recursive: true });
+		assert.deepEqual(readTracksTree(tracksDir).children, [], "the tree is empty");
+
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 0, "the marker skips re-importing the ledger");
+		assert.deepEqual(readTracksTree(tracksDir).children, [], "deleted tickets and tracks stay deleted");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
