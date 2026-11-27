@@ -256,6 +256,64 @@ Intro.
 `);
 });
 
+test("clearCompleted keeps lookalike-checkbox detail under a pending issue but drops it with a completed one", () => {
+	const plan = `## t
+
+- [ ] Keep me
+  - [x] Nested note
+  - [ ] Another note
+- [x] Drop me
+  - [x] Nested done
+`;
+	assert.equal(clearCompleted(plan), `## t
+
+- [ ] Keep me
+  - [x] Nested note
+  - [ ] Another note
+`);
+	assert.deepEqual(parseTracks(clearCompleted(plan))[0]!.issues, [
+		{ text: "Keep me", status: "pending", detail: "- [x] Nested note\n- [ ] Another note" },
+	]);
+});
+
+test("clearCompleted review repros and fully done tracks agree with parseTracks", () => {
+	// Repro: a completed issue above an open-looking detail drops both, not just the issue.
+	const completedAboveOpen = `## t
+
+- [x] Done
+  - [ ] open-looking detail
+- [ ] Next
+`;
+	assert.equal(clearCompleted(completedAboveOpen), `## t
+
+- [ ] Next
+`);
+
+	// Repro: a pending issue above a completed-looking detail keeps both.
+	const pendingAboveCompleted = `## t
+
+- [ ] Pending
+  - [x] done-looking detail
+`;
+	assert.equal(clearCompleted(pendingAboveCompleted), pendingAboveCompleted);
+
+	// A fully done track is dropped whole, even when its detail looks like an open issue.
+	const fullyDone = `## t
+
+- [x] Done
+  - [ ] open-looking detail
+
+## u
+
+- [ ] Keep
+`;
+	assert.equal(clearCompleted(fullyDone), `## u
+
+- [ ] Keep
+`);
+	assert.deepEqual(parseTracks(clearCompleted(fullyDone)).map((track) => track.name), ["u"]);
+});
+
 test("task labels strip markers and stopwords", () => {
 	assert.equal(taskLabel("Build the API [parallel]"), "Build API");
 	assert.equal(taskLabel("`wire` the **UI** [parallel:ui]"), "wire UI");

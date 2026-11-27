@@ -260,6 +260,22 @@ export function appendIssue(text: string, trackName: string, issueText: string, 
 	return lines.join(eolOf(text));
 }
 
+// Classify block lines the way parseTracks does: an indented line stays detail while an issue is open,
+// even when it looks like `  - [x] note`, so detail never surfaces as a top-level issue.
+function classifyLines(lines: string[]): { line: string; issue?: TrackStatus; detail: boolean }[] {
+	let open: TrackStatus | undefined;
+	return lines.map((line) => {
+		if (open && TRACK_DETAIL.test(line)) return { line, issue: open, detail: true };
+		const found = line.match(TRACK_ISSUE);
+		if (found) {
+			open = issueStatus(found[2]!);
+			return { line, issue: open, detail: false };
+		}
+		open = undefined;
+		return { line, detail: false };
+	});
+}
+
 // Drop fully completed tracks and completed issues plus their detail blocks; unrelated lines stay as-is.
 export function clearCompleted(text: string): string {
 	const lines = linesOf(text);
@@ -269,22 +285,16 @@ export function clearCompleted(text: string): string {
 		let end = start + 1;
 		while (end < lines.length && !TRACK_HEADING.test(lines[end]!)) end++;
 		const block = lines.slice(start, end);
-		const issueLines = block.slice(isTrack ? 1 : 0).filter((line) => /^\s*-\s+\[[ xX-]\]\s+/.test(line));
-		if (isTrack && issueLines.length && issueLines.every((line) => /^\s*-\s+\[[xX]\]\s+/.test(line))) {
+		const classified = classifyLines(block.slice(isTrack ? 1 : 0));
+		const issueLines = classified.filter((entry) => entry.issue && !entry.detail);
+		if (isTrack && issueLines.length && issueLines.every((entry) => entry.issue === "completed")) {
 			start = end;
 			continue;
 		}
 		if (isTrack) out.push(block[0]!);
-		let skipDetail = false;
-		for (const line of block.slice(isTrack ? 1 : 0)) {
-			if (TRACK_ISSUE.test(line)) {
-				skipDetail = /^\s*-\s+\[[xX]\]\s+/.test(line);
-				if (!skipDetail) out.push(line);
-				continue;
-			}
-			if (skipDetail && TRACK_DETAIL.test(line)) continue;
-			skipDetail = false;
-			out.push(line);
+		for (const entry of classified) {
+			if (entry.issue === "completed") continue;
+			out.push(entry.line);
 		}
 		start = end;
 	}
