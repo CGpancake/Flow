@@ -134,7 +134,7 @@ test("saved resume step scopes a bare /work without becoming child guidance", ()
 	assert.deepEqual(tasksFromPlanText(plan, "only step 1", "3").map((task) => task.label), ["Set up widget project"]);
 });
 
-test("plan steps keep track and issue refs with detail lines intact", () => {
+test("plan steps keep track and ticket refs with detail lines intact", () => {
 	const trackSteps = `# Plan
 
 Track: widget-api
@@ -143,7 +143,7 @@ Track: widget-api
 
 1. Add route [parallel]
    Track: widget-api
-   Issue: Add route
+   Ticket: Add route
    Route detail line.
 2. Render list
    - Track: widget-ui
@@ -156,7 +156,7 @@ Track: widget-api
 	const tasks = tasksFromPlanText(trackSteps, "keep it lazy");
 	assert.deepEqual(tasks.map((task) => [task.track, task.issue]), [["widget-api", "Add route"], ["widget-ui", "Render list"]]);
 	assert.equal(tasks[0]!.label, "Add route");
-	assert.equal(tasks[0]!.task, "Implement plan step 1: Add route\n   Track: widget-api\n   Issue: Add route\n   Route detail line.\n\nExtra instruction: keep it lazy");
+	assert.equal(tasks[0]!.task, "Implement plan step 1: Add route\n   Track: widget-api\n   Ticket: Add route\n   Route detail line.\n\nExtra instruction: keep it lazy");
 });
 
 test("plan parsing falls back when no numbered steps exist", () => {

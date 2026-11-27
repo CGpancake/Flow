@@ -511,7 +511,7 @@ export function tasksFromPlanText(text: string | undefined, args: string, resume
 	const tasks = planSteps.map((planStep, index) => {
 		const hasParallelNeighbor = planStep.markedParallel && Boolean(planSteps[index - 1]?.markedParallel || planSteps[index + 1]?.markedParallel);
 		const track = planStep.detail.match(/^[ \t]*(?:-[ \t]+)?Track:[ \t]*(.+)$/im)?.[1]?.trim();
-		const issue = planStep.detail.match(/^[ \t]*(?:-[ \t]+)?Issue:[ \t]*(.+)$/im)?.[1]?.trim();
+		const issue = planStep.detail.match(/^[ \t]*(?:-[ \t]+)?(?:Issue|Ticket):[ \t]*(.+)$/im)?.[1]?.trim();
 		const detail = planStep.detail.trimEnd();
 		return {
 			agent: "worker" as const,
