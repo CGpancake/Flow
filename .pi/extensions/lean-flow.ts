@@ -13,25 +13,29 @@ import { dirname, join, resolve } from "node:path";
 import {
 	appendPlanStep,
 	branchSlug,
-	clearCompleted,
+	migrateTracksMd,
 	PLAN_HEADING,
 	planGoal,
 	planStepCount,
 	planStepsFromText,
 	planTrack,
-	parseTracks,
+	parseIssueFile,
 	pathRefs,
+	readTracksTree,
 	reviewVerdict,
 	runId as makeRunId,
-	setIssueStatus,
+	serializeIssueFile,
 	slugify,
 	staleRunIds,
 	taskFileName,
 	taskLabel,
 	tasksFromPlanText,
+	type IssueStatus,
 	type LeanAgent,
 	type LeanTask,
 	type PlanStep,
+	type TrackIssueFile,
+	type TrackNode,
 } from "../../lean-flow-plan.ts";
 
 const LEAN_SYSTEM_BASE = `LEAN FLOW ACTIVE. CONCISE PONYTAIL-FULL BASELINE; DO NOT AUTO-LOAD SKILLS.
@@ -46,7 +50,7 @@ Permanent rules for the parent agent:
 - Output caveman-terse: code/actions first, then at most three short lines.
 - Use batched grill only when ambiguity changes implementation. Generate the whole question batch at once, then evaluate answers as a batch.
 - If context usage reaches about 50%, prepare a /handover and stop instead of compacting by default.
-- Tracks live in the committed .pi/tracks.md: tick completed issues as "- [x]" and add new issues under the right track; never rewrite unrelated tracks.`;
+- Tracks live as folders and issue files under .pi/tracks/: mark an issue doing/done in its frontmatter and add new issues as .md files under the right track path; never rewrite unrelated tracks.`;
 
 const LEAN_SYSTEM_WORKFLOW = `
 - No long-term memory, lifecycle docs, ADRs, or issue tracker ceremony unless the user explicitly asks.
@@ -175,7 +179,7 @@ Rules:
 - Keep modules feature/function focused and readable; split only by reason-to-change.
 - For non-trivial modules you touch, keep/add a tiny top header: purpose, main entry points, split trigger. Use rg over headers first; avoid broad reads unless slices prove insufficient.
 - Do not create memory/docs/ADRs/plans. Code and tests are the source of truth.
-- If .pi/tracks.md has the issue you completed, tick it "- [x]"; add new issues under the right track; never rewrite unrelated tracks.
+- If a matching issue file under .pi/tracks/ is yours, set its frontmatter status to done; add new issues as .md files under the right track path; never rewrite unrelated tracks.
 - Run the smallest relevant check. If no automated check exists, say so.
 - Output caveman-terse: changed files; checks; blockers; manual validation. No essays.
 
@@ -525,12 +529,12 @@ function planDir(cwd: string): string {
 	return join(cwd, CONFIG_DIR_NAME, "lean-flow", branchSlug(gitBranch(cwd)));
 }
 
-// .pi is local scratch space except tracks.md (committed issue ledger) and extension code.
+// .pi is local scratch space except extension code.
 async function ensurePiGitignore(cwd: string): Promise<void> {
 	const path = join(cwd, CONFIG_DIR_NAME, ".gitignore");
 	const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
 	const lines = existing.split(/\r?\n/);
-	const missing = ["*", "!tracks.md", "!extensions/", "!extensions/**"].filter((line) => !lines.includes(line));
+	const missing = ["*", "!extensions/", "!extensions/**"].filter((line) => !lines.includes(line));
 	if (!missing.length) return;
 	const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
 	await writeFile(path, existing + prefix + missing.join("\n") + "\n", "utf8");
@@ -564,15 +568,15 @@ function planAddPrompt(current: string, scope: string): string {
 	return `Extend the existing plan instead of replacing it. Keep every existing numbered step byte-identical: same number, text, order, and indented detail lines; no rewrite, no renumbering, no reordering, and no edits to the title or other sections. Append only new atomic numbered steps to the ## Implementation section, continuing after the highest existing number (next step: ${highest + 1}). ${PLAN_RULES} Then call save_plan with the merged document, passing the current title${track ? ` and track "${track}"` : ""}. A running /work picks the new steps up at its next boundary. No memory/docs/ADRs. Scope for the new steps:\n${scope || "Use the current conversation goal."}\n\nCurrent plan.md:\n\n${current}`;
 }
 
-function startPlan(pi: ExtensionAPI, ctx: ExtensionContext, input: string): void {
+async function startPlan(pi: ExtensionAPI, ctx: ExtensionContext, input: string): Promise<void> {
 	const name = input.match(/^track\s+(.+)$/i)?.[1]?.trim();
-	const track = name ? trackScope(ctx.cwd, name) : undefined;
+	const track = name ? await trackScope(ctx.cwd, name) : undefined;
 	if (name && !track) {
-		unknownTrack(ctx, name);
+		await unknownTrack(ctx, name);
 		return;
 	}
 	const scope = track
-		? `Work the "${track.name}" track from .pi/tracks.md. Emit exactly one numbered implementation step per open issue (marker [ ] or [-]); skip [x] issues. Carry an indented \`Track: ${track.name}\` line and an \`Issue: <issue text>\` line under each step, and use the issue detail to shape the step. Issues:\n${track.issues}`
+		? `Work the "${track.name}" track from .pi/tracks/. Emit exactly one numbered implementation step per open issue (status todo or doing); skip done issues. Carry an indented \`Track: ${track.name}\` line and an \`Issue: <issue title>\` line under each step, and use the issue body to shape the step. Issues:\n${track.issues}`
 		: input || "Use the current conversation goal.";
 	send(pi, planPrompt(scope));
 }
@@ -1022,40 +1026,101 @@ function resolvedToolPath(cwd: string, path: string): string {
 	return resolve(cwd, path.startsWith("@") ? path.slice(1) : path);
 }
 
-function trackList(tracks: ReturnType<typeof parseTracks>): string[] {
-	return tracks.map((track) => `${track.name}: ${track.issues.filter((issue) => issue.status !== "completed").length} open / ${track.issues.length}`);
+function trackList(node: TrackNode, lines: string[] = []): string[] {
+	for (const child of node.children) {
+		lines.push(`${child.path}: ${child.issues.filter((issue) => issue.status !== "done").length} open / ${child.issues.length}`);
+		trackList(child, lines);
+	}
+	return lines;
+}
+
+function tracksDir(cwd: string): string {
+	return join(cwd, CONFIG_DIR_NAME, "tracks");
+}
+
+// One-shot `tracks.md` -> `.pi/tracks/` on first track access. migrateTracksMd is a no-op once
+// the tree has entries; the cache keeps a later clear from re-importing the old ledger.
+const tracksMigrated = new Set<string>();
+async function ensureTracks(cwd: string): Promise<string> {
+	const dir = tracksDir(cwd);
+	if (!tracksMigrated.has(dir)) {
+		await migrateTracksMd(join(cwd, CONFIG_DIR_NAME, "tracks.md"), dir);
+		tracksMigrated.add(dir);
+	}
+	await ensurePiGitignore(cwd);
+	return dir;
+}
+
+function trackSegments(name: string): string[] | undefined {
+	const segments = name.trim().split(/[\\/]/).map((segment) => segment.trim()).filter(Boolean);
+	return segments.length && !segments.some((segment) => segment === "." || segment === "..") ? segments : undefined;
+}
+
+function findTrack(root: TrackNode, name: string): TrackNode | undefined {
+	const segments = trackSegments(name);
+	if (!segments) return undefined;
+	let node: TrackNode | undefined = root;
+	for (const segment of segments) {
+		node = node.children.find((child) => child.name.toLowerCase() === segment.toLowerCase());
+		if (!node) return undefined;
+	}
+	return node;
+}
+
+const ISSUE_MARKER: Record<IssueStatus, string> = { todo: " ", doing: "-", done: "x" };
+
+function issueLine(issue: TrackIssueFile): string {
+	return `- [${ISSUE_MARKER[issue.status]}] ${issue.title}${issue.body ? `\n${issue.body.replace(/^/gm, "  ")}` : ""}`;
+}
+
+function issueLines(issues: TrackIssueFile[], openOnly = false): string {
+	return issues.filter((issue) => !openOnly || issue.status !== "done").map(issueLine).join("\n");
+}
+
+async function clearCompletedFiles(dir: string): Promise<number> {
+	if (!existsSync(dir)) return 0;
+	let cleared = 0;
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) cleared += await clearCompletedFiles(path);
+		else if (entry.isFile() && /\.md$/i.test(entry.name) && parseIssueFile(readFileSync(path, "utf8"), entry.name).status === "done") {
+			await rm(path);
+			cleared++;
+		}
+	}
+	return cleared;
 }
 
 let issueWrite = Promise.resolve();
-// Serialized because parallel workers share one tracks.md read-modify-write.
+// Serialized because parallel workers share the tree read-modify-write.
 async function writeIssueStatus(cwd: string, task: LeanTask, status: "started" | "completed"): Promise<void> {
 	if (!task.track || !task.issue) return;
-	const path = join(cwd, CONFIG_DIR_NAME, "tracks.md");
 	issueWrite = issueWrite
 		.then(async () => {
-			if (!existsSync(path)) return;
-			const text = readFileSync(path, "utf8");
-			const next = setIssueStatus(text, task.track!, task.issue!, status);
-			if (next !== text) await writeFile(path, next, "utf8");
+			const rootDir = await ensureTracks(cwd);
+			const track = findTrack(readTracksTree(rootDir), task.track!);
+			const issue = track?.issues.find((candidate) => candidate.title === task.issue);
+			if (!issue) return;
+			const next = status === "completed" ? "done" : "doing";
+			if (issue.status === next) return;
+			await writeFile(join(rootDir, ...issue.path.split("/")), serializeIssueFile({ title: issue.title, status: next, body: issue.body }), "utf8");
 		})
 		.catch(() => {});
 	await issueWrite;
 }
 
-// Shared by /grill and /plan: `track <name>` loads that committed track's issues and details.
-function trackScope(cwd: string, name: string): { name: string; issues: string } | undefined {
-	const path = join(cwd, CONFIG_DIR_NAME, "tracks.md");
-	const track = parseTracks(existsSync(path) ? readFileSync(path, "utf8") : "").find((candidate) => candidate.name.toLowerCase() === name.toLowerCase());
+// Shared by /grill and /plan: `track <path>` loads that track's issue files and bodies.
+async function trackScope(cwd: string, name: string): Promise<{ name: string; issues: string } | undefined> {
+	const rootDir = await ensureTracks(cwd);
+	const track = findTrack(readTracksTree(rootDir), name);
 	if (!track) return undefined;
-	const marker = (status: string) => (status === "completed" ? "x" : status === "started" ? "-" : " ");
-	const issues = track.issues.map((issue) => `- [${marker(issue.status)}] ${issue.text}${issue.detail ? `\n  ${issue.detail.replace(/\n/g, "\n  ")}` : ""}`).join("\n");
-	return { name: track.name, issues: issues || "No issues." };
+	return { name: track.path, issues: issueLines(track.issues) || "No issues." };
 }
 
-function unknownTrack(ctx: ExtensionContext, name: string): void {
-	const path = join(ctx.cwd, CONFIG_DIR_NAME, "tracks.md");
-	const lines = trackList(parseTracks(existsSync(path) ? readFileSync(path, "utf8") : ""));
-	ctx.ui.notify(`Unknown track: ${name}\n${lines.join("\n") || `No tracks in ${path}`}`, "warning");
+async function unknownTrack(ctx: ExtensionContext, name: string): Promise<void> {
+	const rootDir = await ensureTracks(ctx.cwd);
+	const lines = trackList(readTracksTree(rootDir));
+	ctx.ui.notify(`Unknown track: ${name}\n${lines.join("\n") || `No tracks in ${rootDir}`}`, "warning");
 }
 
 export default function leanFlow(pi: ExtensionAPI) {
@@ -1678,7 +1743,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			title: Type.String(),
 			markdown: Type.String(),
-			track: Type.Optional(Type.String({ description: "Track name from .pi/tracks.md this plan belongs to." })),
+			track: Type.Optional(Type.String({ description: "Track path from .pi/tracks/ this plan belongs to, e.g. area/sub." })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const dir = await ensureLeanDir(ctx.cwd);
@@ -1742,12 +1807,12 @@ export default function leanFlow(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const input = args.trim();
 			const name = input.match(/^track\s+(.+)$/i)?.[1]?.trim();
-			const track = name ? trackScope(ctx.cwd, name) : undefined;
+			const track = name ? await trackScope(ctx.cwd, name) : undefined;
 			if (name && !track) {
-				unknownTrack(ctx, name);
+				await unknownTrack(ctx, name);
 				return;
 			}
-			const goal = track ? `Work the "${track.name}" track from .pi/tracks.md. Issues:\n${track.issues}` : input || "Use the current conversation goal.";
+			const goal = track ? `Work the "${track.name}" track from .pi/tracks/. Issues:\n${track.issues}` : input || "Use the current conversation goal.";
 			send(pi, `Start a lean batched grill session for this goal. First scan only the relevant repo surface: rg for filenames/line numbers, then read only tight offset/limit slices. Then call grill_batch with all current implementation-blocking questions at once. After I answer, evaluate the full batch and either call grill_batch again or state shared understanding. Goal:\n${goal}`);
 		},
 	});
@@ -1755,7 +1820,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 	pi.registerCommand("plan", {
 		description: "Create a comprehensive temporary implementation plan",
 		handler: async (args, ctx) => {
-			startPlan(pi, ctx, args.trim());
+			await startPlan(pi, ctx, args.trim());
 		},
 	});
 
@@ -1764,7 +1829,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const current = readPlan(ctx.cwd);
 			if (current === undefined) {
-				startPlan(pi, ctx, args.trim());
+				await startPlan(pi, ctx, args.trim());
 				return;
 			}
 			send(pi, planAddPrompt(current, args.trim()));
@@ -2007,62 +2072,82 @@ export default function leanFlow(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("track", {
-		description: "List .pi/tracks.md tracks (the /tracks alias was removed; use /track); /track add <name>, /track clear, /track <name> shows issues and injects the prototype skill",
+		description: "List .pi/tracks/ tracks (the /tracks alias was removed); /track add <area/sub>, /track rename <old> <new>, /track clear, /track <area/sub> shows issues and injects the prototype skill",
 		handler: async (args, ctx) => {
-			const path = join(ctx.cwd, CONFIG_DIR_NAME, "tracks.md");
+			const rootDir = await ensureTracks(ctx.cwd);
 			const input = args.trim();
-			let text = existsSync(path) ? readFileSync(path, "utf8") : "";
-			const tracks = parseTracks(text);
 			if (/^add\b/i.test(input)) {
 				const name = input.match(/^add\s+(.+)$/i)?.[1]?.trim();
-				if (!name) {
-					ctx.ui.notify("Usage: /track add <name>", "warning");
+				const segments = name ? trackSegments(name) : undefined;
+				if (!segments) {
+					ctx.ui.notify("Usage: /track add <area/sub>", "warning");
 					return;
 				}
-				if (tracks.some((track) => track.name.toLowerCase() === name.toLowerCase())) {
-					ctx.ui.notify(`Track already exists: ${name}`, "warning");
+				const path = join(rootDir, ...segments);
+				if (existsSync(path) || findTrack(readTracksTree(rootDir), segments.join("/"))) {
+					ctx.ui.notify(`Track already exists: ${segments.join("/")}`, "warning");
 					return;
 				}
-				await ensurePiGitignore(ctx.cwd);
-				text = `${text.trimEnd()}${text.trim() ? "\n\n" : ""}## ${name}\n`;
-				await writeFile(path, text, "utf8");
-				ctx.ui.notify(`Added track: ${name}`, "info");
+				await mkdir(path, { recursive: true });
+				ctx.ui.notify(`Added track: ${segments.join("/")}`, "info");
+				return;
+			}
+			if (/^rename\b/i.test(input)) {
+				const match = input.match(/^rename\s+(.+?)\s+(?:->|to)\s+(.+)$/i) ?? input.match(/^rename\s+(\S+)\s+(\S+)$/i);
+				if (!match) {
+					ctx.ui.notify("Usage: /track rename <old> <new> (or <old> to <new>)", "warning");
+					return;
+				}
+				const track = findTrack(readTracksTree(rootDir), match[1]!);
+				if (!track) {
+					await unknownTrack(ctx, match[1]!);
+					return;
+				}
+				const segments = trackSegments(match[2]!);
+				if (!segments) {
+					ctx.ui.notify("Usage: /track rename <old> <new> (or <old> to <new>)", "warning");
+					return;
+				}
+				const targetPath = segments.join("/");
+				const lower = targetPath.toLowerCase();
+				if (lower === track.path.toLowerCase()) return;
+				if (lower.startsWith(`${track.path.toLowerCase()}/`)) {
+					ctx.ui.notify(`Cannot move ${track.path} inside itself`, "warning");
+					return;
+				}
+				const target = join(rootDir, ...segments);
+				if (existsSync(target) || findTrack(readTracksTree(rootDir), targetPath)) {
+					ctx.ui.notify(`Track already exists: ${targetPath}`, "warning");
+					return;
+				}
+				await mkdir(dirname(target), { recursive: true });
+				await rename(join(rootDir, ...track.path.split("/")), target);
+				ctx.ui.notify(`Renamed track: ${track.path} -> ${targetPath}`, "info");
 				return;
 			}
 			if (/^clear$/i.test(input)) {
-				if (!text) {
-					ctx.ui.notify(`No tracks in ${path}`, "warning");
+				const tree = readTracksTree(rootDir);
+				if (!tree.children.length && !tree.issues.length) {
+					ctx.ui.notify(`No tracks in ${rootDir}`, "warning");
 					return;
 				}
-				const next = clearCompleted(text);
-				if (next === text) {
-					ctx.ui.notify("No completed issues to clear", "info");
-					return;
-				}
-				await writeFile(path, next, "utf8");
-				ctx.ui.notify(`Cleared completed issues in ${path}`, "info");
+				const cleared = await clearCompletedFiles(rootDir);
+				ctx.ui.notify(cleared ? `Cleared ${cleared} completed issue${cleared === 1 ? "" : "s"} in ${rootDir}` : "No completed issues to clear", "info");
 				return;
 			}
 			if (!input) {
-				const lines = trackList(tracks);
-				ctx.ui.notify(lines.length ? `Tracks:\n${lines.join("\n")}` : `No tracks in ${path}; use /track add <name>`, lines.length ? "info" : "warning");
+				const lines = trackList(readTracksTree(rootDir));
+				ctx.ui.notify(lines.length ? `Tracks:\n${lines.join("\n")}` : `No tracks in ${rootDir}; use /track add <area/sub>`, lines.length ? "info" : "warning");
 				return;
 			}
-			const track = tracks.find((candidate) => candidate.name.toLowerCase() === input.toLowerCase());
+			const track = findTrack(readTracksTree(rootDir), input);
 			if (!track) {
-				ctx.ui.notify(`Unknown track: ${input}\n${trackList(tracks).join("\n") || `No tracks in ${path}`}`, "warning");
+				await unknownTrack(ctx, input);
 				return;
 			}
-			const marker = (status: string) => (status === "completed" ? "x" : status === "started" ? "-" : " ");
-			const details = track.issues.length
-				? track.issues.map((issue) => `- [${marker(issue.status)}] ${issue.text}${issue.detail ? `\n  ${issue.detail.replace(/\n/g, "\n  ")}` : ""}`).join("\n")
-				: "No issues.";
-			ctx.ui.notify(`Track ${track.name}:\n${details}`, "info");
-			const open = track.issues.filter((issue) => issue.status !== "completed");
-			const openText = open.length
-				? open.map((issue) => `- [${marker(issue.status)}] ${issue.text}${issue.detail ? `\n  ${issue.detail.replace(/\n/g, "\n  ")}` : ""}`).join("\n")
-				: "No open issues; review the track and ask what to prototype.";
-			send(pi, `/skill:prototype Work the "${track.name}" track from .pi/tracks.md. Open issues:\n${openText}`, true);
+			ctx.ui.notify(`Track ${track.path}:\n${issueLines(track.issues) || "No issues."}`, "info");
+			const openText = issueLines(track.issues, true) || "No open issues; review the track and ask what to prototype.";
+			send(pi, `/skill:prototype Work the "${track.path}" track from .pi/tracks/. Open issues:\n${openText}`, true);
 		},
 	});
 

@@ -1,5 +1,10 @@
-// Pure plan/run helpers for lean-flow. Entry points: branchSlug, tasksFromPlanText, parseTracks, reviewVerdict.
+// Pure plan/run helpers for lean-flow. Entry points: branchSlug, tasksFromPlanText, parseTracks,
+// parseIssueFile, readTracksTree, migrateTracksMd, reviewVerdict.
 // No Pi imports so tests/*.test.ts can run under plain `node --test`.
+
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export type LeanAgent = "worker" | "reviewer" | "researcher";
 
@@ -212,6 +217,90 @@ export function parseTracks(text: string): Track[] {
 		issue = undefined;
 	}
 	return tracks;
+}
+
+// Folder-based tracks: every subfolder is a track, every `*.md` file is an issue file.
+export type IssueStatus = "todo" | "doing" | "done";
+export type TrackIssueFile = { title: string; status: IssueStatus; body: string; path: string };
+export type TrackNode = { name: string; path: string; children: TrackNode[]; issues: TrackIssueFile[] };
+
+const MIGRATED_STATUS: Record<TrackStatus, IssueStatus> = { pending: "todo", started: "doing", completed: "done" };
+
+function baseName(path: string): string {
+	return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+}
+
+function isIssueStatus(value: string | undefined): value is IssueStatus {
+	return value === "todo" || value === "doing" || value === "done";
+}
+
+// Title = first `# ` heading, else the filename without `.md`. Status = frontmatter `status:`,
+// limited to todo/doing/done (default todo). Body = the markdown left after both are removed.
+export function parseIssueFile(text: string, filename: string): { title: string; status: IssueStatus; body: string } {
+	const source = text.replace(/^\uFEFF/, "");
+	const frontmatter = source.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
+	const rawStatus = frontmatter?.[1]
+		.split(/\r?\n/)
+		.map((line) => line.match(/^\s*status\s*:\s*(.+?)\s*$/i)?.[1]?.replace(/^["']|["']$/g, "").toLowerCase())
+		.find(Boolean);
+	const rest = frontmatter ? source.slice(frontmatter[0].length) : source;
+	const lines = rest.split(/\r?\n/);
+	const heading = lines.findIndex((line) => /^#[ \t]+\S/.test(line));
+	const title = heading >= 0 ? lines[heading]!.replace(/^#[ \t]+/, "").trim() : baseName(filename).replace(/\.md$/i, "");
+	if (heading >= 0) lines.splice(heading, 1);
+	return { title, status: isIssueStatus(rawStatus) ? rawStatus : "todo", body: lines.join("\n").trim() };
+}
+
+export function serializeIssueFile(issue: { title: string; status: IssueStatus; body?: string }): string {
+	const title = issue.title.trim();
+	const body = (issue.body ?? "").trim();
+	return `---\nstatus: ${issue.status}\n---\n\n# ${title}${body ? `\n\n${body}` : ""}\n`;
+}
+
+function readTrackDir(dir: string, name: string, path: string): TrackNode {
+	const node: TrackNode = { name, path, children: [], issues: [] };
+	if (!existsSync(dir)) return node;
+	const entries = readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+	for (const entry of entries) {
+		const childPath = path ? `${path}/${entry.name}` : entry.name;
+		if (entry.isDirectory()) node.children.push(readTrackDir(join(dir, entry.name), entry.name, childPath));
+		else if (entry.isFile() && /\.md$/i.test(entry.name)) {
+			node.issues.push({ ...parseIssueFile(readFileSync(join(dir, entry.name), "utf8"), entry.name), path: childPath });
+		}
+	}
+	return node;
+}
+
+// Root node represents the tracks directory itself; its `children` are the top-level tracks.
+export function readTracksTree(root: string): TrackNode {
+	return readTrackDir(root, baseName(root), "");
+}
+
+// One-shot `tracks.md` -> folders + issue files. Skips when there is no source or the target is
+// already populated, and never deletes `tracks.md` (humans compare before deleting it).
+export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<boolean> {
+	if (!existsSync(tracksMdPath)) return false;
+	try {
+		if (readdirSync(tracksDir).length) return false;
+	} catch {}
+	const tracks = parseTracks(readFileSync(tracksMdPath, "utf8"));
+	if (!tracks.length) return false;
+	const used = new Map<string, Set<string>>();
+	for (const track of tracks) {
+		const segments = track.name.split("/").map((segment) => segment.trim()).filter((segment) => segment && segment !== "." && segment !== "..");
+		const dir = segments.length ? join(tracksDir, ...segments) : tracksDir;
+		await mkdir(dir, { recursive: true });
+		const names = used.get(dir) ?? new Set<string>();
+		used.set(dir, names);
+		for (const issue of track.issues) {
+			const base = slugify(issue.text, 60);
+			let file = `${base}.md`;
+			for (let n = 2; names.has(file); n++) file = `${base}-${n}.md`;
+			names.add(file);
+			await writeFile(join(dir, file), serializeIssueFile({ title: issue.text, status: MIGRATED_STATUS[issue.status], body: issue.detail }), "utf8");
+		}
+	}
+	return true;
 }
 
 type IssueRef = number | string | Pick<TrackIssue, "text">;

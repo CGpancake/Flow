@@ -1,6 +1,9 @@
 // Pure lean-flow plan/run contracts. Entry point: node --test tests/*.test.ts.
 
 import assert from "node:assert/strict";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -8,15 +11,19 @@ import {
 	appendPlanStep,
 	branchSlug,
 	clearCompleted,
+	migrateTracksMd,
+	parseIssueFile,
+	parseTracks,
+	pathRefs,
 	planGoal,
 	planImplementation,
 	planStepCount,
 	planStepsFromText,
 	planTrack,
-	parseTracks,
-	pathRefs,
-	setIssueStatus,
+	readTracksTree,
 	reviewVerdict,
+	serializeIssueFile,
+	setIssueStatus,
 	shortPath,
 	runId,
 	slugify,
@@ -387,4 +394,101 @@ test("REVIEW verdict parses only the final line", () => {
 	assert.equal(reviewVerdict("REVIEW: blocking\none more note"), undefined);
 	assert.equal(reviewVerdict("no verdict here"), undefined);
 	assert.equal(reviewVerdict(""), undefined);
+});
+
+test("readTracksTree parses nested folders and issue files", () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-tracks-"));
+	try {
+		mkdirSync(join(root, "area", "sub"), { recursive: true });
+		writeFileSync(join(root, "area", "sub", "fix-route.md"), "---\nstatus: doing\n---\n\n# Fix route\n\nRoute detail.\n");
+		writeFileSync(join(root, "area", "sub", "no-heading.md"), "---\nstatus: done\n---\n\nBody without heading.\n");
+		writeFileSync(join(root, "area", "notes.txt"), "not an issue");
+		writeFileSync(join(root, "solo.md"), "# Solo issue\n");
+
+		const tree = readTracksTree(root);
+		assert.deepEqual(tree.children.map((child) => child.name), ["area"]);
+		assert.deepEqual(tree.issues.map((issue) => issue.path), ["solo.md"]);
+
+		const area = tree.children[0]!;
+		assert.equal(area.path, "area");
+		assert.deepEqual(area.issues, []);
+		assert.deepEqual(area.children.map((child) => child.name), ["sub"]);
+
+		const sub = area.children[0]!;
+		assert.equal(sub.path, "area/sub");
+		assert.deepEqual(sub.issues.map((issue) => [issue.title, issue.status, issue.body, issue.path]), [
+			["Fix route", "doing", "Route detail.", "area/sub/fix-route.md"],
+			["no-heading", "done", "Body without heading.", "area/sub/no-heading.md"],
+		]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("issue file frontmatter status round-trips", () => {
+	for (const status of ["todo", "doing", "done"] as const) {
+		const text = serializeIssueFile({ title: "Round trip", status, body: "First line.\n\nSecond line." });
+		const parsed = parseIssueFile(text, "ignored.md");
+		assert.deepEqual(parsed, { title: "Round trip", status, body: "First line.\n\nSecond line." });
+		assert.equal(serializeIssueFile(parsed), text);
+	}
+
+	assert.deepEqual(parseIssueFile("# Title only\n", "file.md"), { title: "Title only", status: "todo", body: "" });
+	assert.deepEqual(parseIssueFile("plain body\n", "fallback.md"), { title: "fallback", status: "todo", body: "plain body" });
+	assert.equal(parseIssueFile("---\nstatus: blocked\n---\n# X\n", "x.md").status, "todo");
+});
+
+test("readTracksTree keeps empty folders as tracks", () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-empty-"));
+	try {
+		mkdirSync(join(root, "empty", "nested-empty"), { recursive: true });
+		const tree = readTracksTree(root);
+		assert.deepEqual(tree.children.map((child) => [child.name, child.path, child.issues, child.children.map((nested) => nested.name)]), [
+			["empty", "empty", [], ["nested-empty"]],
+		]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("migrateTracksMd writes folders and issue files with detail", async () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-migrate-"));
+	try {
+		const tracksMd = join(root, "tracks.md");
+		const tracksDir = join(root, ".pi", "tracks");
+		writeFileSync(tracksMd, `# Tracks
+
+## widget-api
+
+- [ ] Add route
+  Route detail line.
+  Second route line.
+- [-] Add test
+\tTabbed detail.
+- [x] Ship docs
+
+## area/sub
+
+- [ ] Nested issue
+  Nested detail.
+`);
+
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), true);
+		assert.ok(existsSync(tracksMd), "tracks.md stays for humans to compare");
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), false, "second run is a no-op");
+
+		const tree = readTracksTree(tracksDir);
+		assert.deepEqual(tree.children.map((child) => child.name), ["area", "widget-api"]);
+		assert.deepEqual(tree.children[0]!.children[0]!.issues.map((issue) => [issue.title, issue.status, issue.body]), [
+			["Nested issue", "todo", "Nested detail."],
+		]);
+		assert.deepEqual(tree.children[1]!.issues.map((issue) => [issue.title, issue.status, issue.body, issue.path]), [
+			["Add route", "todo", "Route detail line.\nSecond route line.", "widget-api/add-route.md"],
+			["Add test", "doing", "Tabbed detail.", "widget-api/add-test.md"],
+			["Ship docs", "done", "", "widget-api/ship-docs.md"],
+		]);
+		assert.match(readFileSync(join(tracksDir, "widget-api", "add-route.md"), "utf8"), /^---\nstatus: todo\n---\n\n# Add route\n\nRoute detail line\.\nSecond route line\.\n$/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
