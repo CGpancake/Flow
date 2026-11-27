@@ -16,6 +16,7 @@ import {
 	ARCHIVE_DIR,
 	branchSlug,
 	filterTickets,
+	INBOX_DIR,
 	migrateTracksMd,
 	mintTicketId,
 	PLAN_HEADING,
@@ -23,7 +24,6 @@ import {
 	planStepCount,
 	planStepsFromText,
 	planTrack,
-	parseTicketFile,
 	pathRefs,
 	readTracksTree,
 	restoreTicket,
@@ -61,7 +61,7 @@ Permanent rules for the parent agent:
 - Output caveman-terse: code/actions first, then at most three short lines.
 - Use batched grill only when ambiguity changes implementation. Generate the whole question batch at once, then evaluate answers as a batch.
 - If context usage reaches about 50%, prepare a /handover and stop instead of compacting by default.
-- Tracks live as folders and issue files under .pi/tracks/: mark an issue doing/done in its frontmatter and add new issues as .md files under the right track path; never rewrite unrelated tracks.`;
+- Tracks live as folders of typed ticket files under .pi/tracks/: filename <type>-<id>-<slug>.md, frontmatter status todo|started|done. Create tickets with /ticket add <type> <title> [track <path>], never by hand-writing .md files; set a ticket's status to started/done in its frontmatter; never rewrite unrelated tracks.`;
 
 const LEAN_SYSTEM_WORKFLOW = `
 - No long-term memory, lifecycle docs, ADRs, or issue tracker ceremony unless the user explicitly asks.
@@ -190,7 +190,7 @@ Rules:
 - Keep modules feature/function focused and readable; split only by reason-to-change.
 - For non-trivial modules you touch, keep/add a tiny top header: purpose, main entry points, split trigger. Use rg over headers first; avoid broad reads unless slices prove insufficient.
 - Do not create memory/docs/ADRs/plans. Code and tests are the source of truth.
-- If a matching issue file under .pi/tracks/ is yours, set its frontmatter status to done; add new issues as .md files under the right track path; never rewrite unrelated tracks.
+- If a matching ticket under .pi/tracks/ is yours, set its frontmatter status to started/done; create tickets with /ticket add, never hand-written .md files; never rewrite unrelated tracks.
 - Run the smallest relevant check. If no automated check exists, say so.
 - Output caveman-terse: changed files; checks; blockers; manual validation. No essays.
 
@@ -777,7 +777,7 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 				const status = statusOf(row);
 				const color = status === "running" ? "warning" : status === "done" ? "text" : status === "failed" || status === "cancelled" || status === "interrupted" ? "error" : "dim";
 				const branch = i === rows.length - 1 ? "└─" : "├─";
-				const label = padRightVisible(`${icons[i]} ${truncateToWidth(row.label, titleWidth, "…", true)}`, titleWidth);
+				const label = padRightVisible(truncateToWidth(`${icons[i]} ${row.label}`, titleWidth, "…", true), titleWidth);
 				lines.push(theme.fg(color, branch) + " " + theme.fg(color, label) + theme.fg(color, right(row)));
 				// Live status lives on its own branch line so rail columns never shift as text arrives.
 				if (status === "running" && row.task?.latest) {
@@ -1128,12 +1128,10 @@ function parseTicketFilters(input: string): { filters: TicketFilters; rest: stri
 	return { filters, rest };
 }
 
-// Optional `track <path>` / `--track <path>` prefix or suffix names the ticket track.
+// Only an explicit leading `--track <path>` / `track <path>` names the ticket track, so title words never become a track.
 function splitTicketTrack(input: string): { track?: string; text: string } {
 	const prefix = input.match(/^(?:--track|track)[:=]?\s+(\S+)\s+([\s\S]+)$/i);
 	if (prefix) return { track: prefix[1], text: prefix[2]!.trim() };
-	const suffix = input.match(/^([\s\S]+?)\s+(?:--track|track)[:=]?\s+(\S+)$/i);
-	if (suffix) return { track: suffix[2], text: suffix[1]!.trim() };
 	return { text: input.trim() };
 }
 
@@ -1184,18 +1182,10 @@ function issueLines(issues: Ticket[], openOnly = false): string {
 	return issues.filter((issue) => !openOnly || issue.status !== "done").map(issueLine).join("\n");
 }
 
-async function clearCompletedFiles(dir: string): Promise<number> {
-	if (!existsSync(dir)) return 0;
-	let cleared = 0;
-	for (const entry of readdirSync(dir, { withFileTypes: true })) {
-		const path = join(dir, entry.name);
-		if (entry.isDirectory()) cleared += await clearCompletedFiles(path);
-		else if (entry.isFile() && /\.md$/i.test(entry.name) && parseTicketFile(readFileSync(path, "utf8"), entry.name).status === "done") {
-			await rm(path);
-			cleared++;
-		}
-	}
-	return cleared;
+async function archiveCompletedFiles(rootDir: string): Promise<number> {
+	const done = filterTickets(readTracksTree(rootDir), { status: "done" }).filter((ticket) => ticket.path.split("/")[0] !== ARCHIVE_DIR);
+	for (const ticket of done) await archiveTicket(rootDir, ticket);
+	return done.length;
 }
 
 let issueWrite = Promise.resolve();
@@ -2251,8 +2241,8 @@ export default function leanFlow(pi: ExtensionAPI) {
 					ctx.ui.notify(`No tracks in ${rootDir}`, "warning");
 					return;
 				}
-				const cleared = await clearCompletedFiles(rootDir);
-				ctx.ui.notify(cleared ? `Cleared ${cleared} completed issue${cleared === 1 ? "" : "s"} in ${rootDir}` : "No completed issues to clear", "info");
+				const archived = await archiveCompletedFiles(rootDir);
+				ctx.ui.notify(archived ? `Archived ${archived} done issue${archived === 1 ? "" : "s"} in ${rootDir}` : "No done issues to archive", "info");
 				return;
 			}
 			if (!input) {
@@ -2298,18 +2288,18 @@ export default function leanFlow(pi: ExtensionAPI) {
 					ctx.ui.notify("Usage: /ticket add <bug|feature|rnd> <title> [track <path>]", "warning");
 					return;
 				}
-				const trackName = named.track ?? planTrack(readPlan(ctx.cwd) ?? "");
-				const track = trackName ? findTrack(tree, trackName) : undefined;
-				if (trackName && !track) {
-					await unknownTrack(ctx, trackName);
+				const requested = named.track ?? planTrack(readPlan(ctx.cwd) ?? "");
+				const track = requested ? findTrack(tree, requested) : undefined;
+				if (!track && named.track && requested?.toLowerCase() !== INBOX_DIR) {
+					await unknownTrack(ctx, named.track);
 					return;
 				}
-				const dir = track ? join(rootDir, ...track.path.split("/")) : rootDir;
+				const dir = track ? join(rootDir, ...track.path.split("/")) : join(rootDir, INBOX_DIR);
 				const ticket = { type, id: mintTicketId(tree), status: "todo" as const, title: named.text, body: "" };
 				const path = join(dir, ticketFileName(ticket));
 				await mkdir(dir, { recursive: true });
 				await writeFile(path, serializeTicketFile(ticket), "utf8");
-				ctx.ui.notify(`Added ${type} ${ticket.id} in ${track?.path ?? "(root)"}: ${ticket.title}`, "info");
+				ctx.ui.notify(`Added ${type} ${ticket.id} in ${track?.path ?? INBOX_DIR}: ${ticket.title}`, "info");
 				return;
 			}
 			if (verb === "show") {
@@ -2350,6 +2340,11 @@ export default function leanFlow(pi: ExtensionAPI) {
 				}
 				const path = join(rootDir, ...ticket.path.split("/"));
 				await writeFile(path, rewriteTicketStatus(readFileSync(path, "utf8"), status), "utf8");
+				if (status === "done" && ticket.path.split("/")[0] !== ARCHIVE_DIR) {
+					const archived = await archiveTicket(rootDir, ticket);
+					ctx.ui.notify(`Ticket ${ticket.id} -> done, archived to ${archived.slice(rootDir.length + 1)}`, "info");
+					return;
+				}
 				ctx.ui.notify(`Ticket ${ticket.id} -> ${status}`, "info");
 				return;
 			}

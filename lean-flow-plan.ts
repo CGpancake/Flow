@@ -269,12 +269,6 @@ export function parseTicketFile(text: string, path: string, track = ticketTrack(
 	return { id, type, status: isTicketStatus(rawStatus) ? rawStatus : "todo", title, body: lines.join("\n").trim(), track, path };
 }
 
-export function serializeIssueFile(issue: { title: string; status: TicketStatus; body?: string }): string {
-	const title = issue.title.trim();
-	const body = (issue.body ?? "").trim();
-	return `---\nstatus: ${issue.status}\n---\n\n# ${title}${body ? `\n\n${body}` : ""}\n`;
-}
-
 function ticketIds(node: TrackNode, ids = new Set<string>()): Set<string> {
 	for (const ticket of node.issues) ids.add(ticket.id);
 	for (const child of node.children) ticketIds(child, ids);
@@ -346,7 +340,7 @@ export function readTracksTree(root: string): TrackNode {
 	return readTrackDir(root, baseName(root), "");
 }
 
-export type TicketFilters = { track?: string; type?: TicketType; status?: TicketStatus; id?: string; idPrefix?: string };
+export type TicketFilters = { track?: string; type?: TicketType; status?: TicketStatus; idPrefix?: string };
 
 function walkTickets(node: TrackNode, visit: (ticket: Ticket) => void): void {
 	for (const ticket of node.issues) visit(ticket);
@@ -358,7 +352,7 @@ export function filterTickets(tree: TrackNode, filters: TicketFilters = {}): Tic
 	const track = filters.track?.replace(/^[/\\]+|[/\\]+$/g, "").toLowerCase();
 	const type = filters.type?.toLowerCase();
 	const status = filters.status?.toLowerCase();
-	const id = (filters.idPrefix ?? filters.id)?.replace(/^#/, "").toLowerCase();
+	const id = filters.idPrefix?.replace(/^#/, "").toLowerCase();
 	const tickets: Ticket[] = [];
 	walkTickets(tree, (ticket) => {
 		const ticketTrackName = ticket.track.toLowerCase();
@@ -393,8 +387,9 @@ export function ticketCounts(tree: TrackNode): Record<string, number> {
 
 // Top-level `archive` is reserved: done tickets mirror their track under archive/<YYYY-MM>/.
 export const ARCHIVE_DIR = "archive";
+export const INBOX_DIR = "inbox";
 
-export function archiveDir(root: string): string {
+function archiveDir(root: string): string {
 	return join(root, ARCHIVE_DIR);
 }
 
@@ -449,17 +444,38 @@ async function renameLegacyTickets(dir: string, used: Set<string>): Promise<bool
 	return changed;
 }
 
+// Top-level `.md` files are not a real track: move them under inbox/ (renaming legacy slugs).
+async function moveRootTickets(root: string, used: Set<string>): Promise<boolean> {
+	if (!existsSync(root)) return false;
+	const inbox = join(root, INBOX_DIR);
+	let changed = false;
+	for (const entry of readdirSync(root, { withFileTypes: true })) {
+		if (!entry.isFile() || !/\.md$/i.test(entry.name)) continue;
+		const source = join(root, entry.name);
+		const ticket = parseTicketFile(readFileSync(source, "utf8"), entry.name);
+		const target = join(inbox, entry.name);
+		const name = TICKET_FILE.test(entry.name) && !existsSync(target)
+			? entry.name
+			: ticketFileName({ type: ticket.type, id: uniqueTicketId(used), title: ticket.title });
+		await mkdir(inbox, { recursive: true });
+		await rename(source, join(inbox, name));
+		changed = true;
+	}
+	return changed;
+}
+
 // One-shot `tracks.md` -> folders + typed ticket files, plus an in-place rename pass for legacy
-// `<slug>.md` tickets. Never deletes `tracks.md` (humans compare before deleting it).
+// `<slug>.md` tickets and a root -> inbox/ move. Never deletes `tracks.md` (humans compare first).
 export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<boolean> {
-	let changed = await renameLegacyTickets(tracksDir, ticketIds(readTracksTree(tracksDir)));
+	const used = ticketIds(readTracksTree(tracksDir));
+	let changed = await moveRootTickets(tracksDir, used);
+	changed = (await renameLegacyTickets(tracksDir, used)) || changed;
 	if (!existsSync(tracksMdPath)) return changed;
 	try {
 		if (readdirSync(tracksDir).length) return changed;
 	} catch {}
 	const tracks = parseTracks(readFileSync(tracksMdPath, "utf8"));
 	if (!tracks.length) return false;
-	const used = new Set<string>();
 	for (const track of tracks) {
 		const segments = track.name.split("/").map((segment) => segment.trim()).filter((segment) => segment && segment !== "." && segment !== "..");
 		const dir = segments.length ? join(tracksDir, ...segments) : tracksDir;

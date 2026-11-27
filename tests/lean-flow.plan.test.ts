@@ -12,6 +12,7 @@ import {
 	archiveTicketPath,
 	branchSlug,
 	filterTickets,
+	INBOX_DIR,
 	migrateTracksMd,
 	mintTicketId,
 	parseTicketFile,
@@ -26,7 +27,6 @@ import {
 	restoreTicket,
 	reviewVerdict,
 	rewriteTicketStatus,
-	serializeIssueFile,
 	serializeTicketFile,
 	shortPath,
 	runId,
@@ -35,6 +35,7 @@ import {
 	taskFileName,
 	taskLabel,
 	tasksFromPlanText,
+	ticketCounts,
 	ticketFileName,
 	ticketIndexLines,
 } from "../lean-flow-plan.ts";
@@ -337,10 +338,10 @@ test("readTracksTree parses nested folders and issue files", () => {
 test("ticket file frontmatter status round-trips", () => {
 	for (const status of ["todo", "started", "done"] as const) {
 		const path = "area/feature-abc123-round-trip.md";
-		const text = serializeIssueFile({ title: "Round trip", status, body: "First line.\n\nSecond line." });
+		const text = serializeTicketFile({ type: "feature", title: "Round trip", status, body: "First line.\n\nSecond line." });
 		const parsed = parseTicketFile(text, path);
 		assert.deepEqual(parsed, { id: "abc123", type: "feature", status, title: "Round trip", body: "First line.\n\nSecond line.", track: "area", path });
-		assert.equal(serializeIssueFile(parsed), text);
+		assert.equal(serializeTicketFile(parsed), text);
 	}
 
 	assert.deepEqual(parseTicketFile("# Title only\n", "bug-a1b2c3-title-only.md"), { id: "a1b2c3", type: "bug", status: "todo", title: "Title only", body: "", track: "", path: "bug-a1b2c3-title-only.md" });
@@ -401,7 +402,7 @@ test("filterTickets combines track prefixes with type, status, and id prefixes",
 	assert.deepEqual(paths({ track: "/area/sub/" }), ["area/sub/feature-ddd444-sub.md"]);
 	assert.deepEqual(paths({ type: "bug" }), ["area/bug-bbb222-area.md"]);
 	assert.deepEqual(paths({ status: "todo" }), ["feature-aaa111-root.md", "area/sub/feature-ddd444-sub.md"]);
-	assert.deepEqual(paths({ id: "#ccc" }), ["area/rnd-ccc333-done.md"]);
+	assert.deepEqual(paths({ idPrefix: "#ccc" }), ["area/rnd-ccc333-done.md"]);
 	assert.deepEqual(paths({ idPrefix: "ddd", track: "area/sub", type: "feature" }), ["area/sub/feature-ddd444-sub.md"]);
 	assert.deepEqual(paths({ track: "area", type: "rnd" }), ["area/rnd-ccc333-done.md"]);
 	assert.deepEqual(paths({ type: "bug", status: "todo" }), []);
@@ -489,6 +490,38 @@ test("migrateTracksMd writes folders and issue files with detail", async () => {
 		assert.match(issues.get("Add test")!.path, /^widget-api\/feature-[0-9a-f]{6}-add-test\.md$/);
 		assert.match(issues.get("Ship docs")!.path, /^widget-api\/feature-[0-9a-f]{6}-ship-docs\.md$/);
 		assert.match(readFileSync(join(tracksDir, issues.get("Add route")!.path), "utf8"), /^---\nstatus: todo\ntype: feature\n---\n\n# Add route\n\nRoute detail line\.\nSecond route line\.\n$/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("migrateTracksMd moves root tickets into inbox and filterTickets loses (root)", async () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-inbox-"));
+	try {
+		const tracksDir = join(root, ".pi", "tracks");
+		mkdirSync(tracksDir, { recursive: true });
+		const typed = "feature-abcdef-root-note.md";
+		writeFileSync(join(tracksDir, typed), "---\nstatus: started\ntype: feature\n---\n\n# Root note\n\nBody.\n");
+		writeFileSync(join(tracksDir, "loose-note.md"), "---\nstatus: todo\n---\n\n# Loose note\n");
+
+		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), true);
+		assert.deepEqual(readdirSync(tracksDir).filter((name) => /\.md$/i.test(name)), []);
+		const inboxNames = readdirSync(join(tracksDir, INBOX_DIR)).sort();
+		assert.equal(inboxNames.length, 2);
+		assert.ok(inboxNames.includes(typed));
+		const renamed = inboxNames.find((name) => name !== typed)!;
+		assert.match(renamed, /^feature-[0-9a-f]{6}-loose-note\.md$/);
+
+		const tree = readTracksTree(tracksDir);
+		const tickets = filterTickets(tree);
+		assert.deepEqual(tickets.map((ticket) => ticket.track), [INBOX_DIR, INBOX_DIR]);
+		assert.deepEqual(filterTickets(tree, { track: INBOX_DIR }).map((ticket) => ticket.title).sort(), ["Loose note", "Root note"]);
+		assert.doesNotMatch(ticketIndexLines(tickets), /\(root\)/);
+		assert.deepEqual(ticketCounts(tree), { [INBOX_DIR]: 2 });
+
+		const moved = readFileSync(join(tracksDir, INBOX_DIR, typed), "utf8");
+		assert.equal(serializeTicketFile(parseTicketFile(moved, `${INBOX_DIR}/${typed}`)), moved);
+		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), false, "second run is a no-op");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

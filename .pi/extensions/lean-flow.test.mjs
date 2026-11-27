@@ -99,7 +99,7 @@ has("const LIVE_LINE_CAP = 10;", "live output uses the full label column instead
 has("const room = Math.max(8, labelWidth - 2);", "live output wraps at the label column width so it clips at the status rail");
 has('return chunks.map((chunk, i) => `${prefix}${padRightVisible(`${i === 0 ? "↳ " : "  "}${chunk}`, labelWidth)} │`);', "live lines pad to the label width and re-emit the status rail divider");
 has("const titleWidth = liveWidth;", "labels pad to the full column so every rail divider aligns");
-has('padRightVisible(`${icons[i]} ${truncateToWidth(row.label, titleWidth', "plan rows pad the label to the rail width");
+has('padRightVisible(truncateToWidth(`${icons[i]} ${row.label}`, titleWidth', "plan rows truncate and pad the combined icon+label to the rail width");
 has('padRightVisible(truncateToWidth(titles[i]!, titleWidth', "chain rows pad the label to the rail width");
 has("streamed = tailText(streamed, ae.delta)", "streamed thinking and text deltas feed the live line instead of a phase word");
 has('phase = "thinking"; streamed = tailText', "thinking deltas replace the generic thinking label");
@@ -168,8 +168,8 @@ has("await mkdir(path, { recursive: true });", "/track add supports nested area/
 has("if (/^rename\\b/i.test(input)) {", "/track rename moves an existing folder");
 has("await rename(join(rootDir, ...track.path.split(\"/\")), target);", "/track rename moves the directory");
 has("Cannot move ${track.path} inside itself", "/track rename rejects moving a track inside itself");
-has("const cleared = await clearCompletedFiles(rootDir);", "/track clear deletes completed issue files");
-has('parseTicketFile(readFileSync(path, "utf8"), entry.name).status === "done"', "/track clear only removes done issue files");
+has("const archived = await archiveCompletedFiles(rootDir);", "/track clear archives completed issue files");
+has('filterTickets(readTracksTree(rootDir), { status: "done" })', "/track clear only archives done issue files");
 has("const openText = issueLines(track.issues, true) || \"No open issues; review the track and ask what to prototype.\";", "/track view injects only open issues");
 has('send(pi, `/skill:prototype Work the "${track.path}" track from .pi/tracks/. Open issues:\\n${openText}`, true);', "/track view injects the prototype skill with the track path");
 has("node.children.find((child) => child.name.toLowerCase() === segment.toLowerCase())", "track lookup is case-insensitive per path segment");
@@ -183,6 +183,10 @@ has('writeIssueStatus(cwd, task, "started")', "a mapped issue is marked started 
 has('if (task.status === "done") await writeIssueStatus(cwd, task, "completed");', "a clean finish marks the mapped issue done");
 has('await writeFile(path, rewriteTicketStatus(readFileSync(path, "utf8"), next), "utf8");', "track progress rewrites only the issue status frontmatter");
 has('if (status === "completed") await archiveTicket(rootDir, issue);', "completed work archives its issue under the mirrored track");
+has('if (status === "done" && ticket.path.split("/")[0] !== ARCHIVE_DIR) {', "/ticket status done archives the ticket after the status write");
+has('ctx.ui.notify(`Ticket ${ticket.id} -> done, archived to ${archived.slice(rootDir.length + 1)}`, "info");', "/ticket status done reports the archived path");
+has("const prefix = input.match(/^(?:--track|track)[:=]?", "/ticket add parses only an explicit leading track prefix");
+assert.ok(!source.includes("const suffix = input.match("), "ticket title words never become a track via a suffix");
 has("issueWrite = issueWrite", "parallel workers serialize tracks tree writes");
 has('pi.registerCommand("ticket"', "/ticket is the ticket surface");
 has("const parsed = input.match(/^(list|show|add|rename|status|restore)\\b\\s*([\\s\\S]*)$/i);", "/ticket splits a verb from the rest of its input");
@@ -199,7 +203,8 @@ has("const shown = tickets.slice(0, Math.max(0, cap));", "ticket index honours t
 has('if (hidden > 0) lines.push(`…${hidden} more`);', "ticket index reports the overflow count");
 has("const lines = ticketIndexLines(filterTickets(tree));", "an unmatched /plan filter shows the capped ticket index");
 has('const ticket = { type, id: mintTicketId(tree), status: "todo" as const, title: named.text, body: "" };', "/ticket add mints an id and starts todo");
-has('const trackName = named.track ?? planTrack(readPlan(ctx.cwd) ?? "");', "/ticket add falls back to the plan's track");
+has('const requested = named.track ?? planTrack(readPlan(ctx.cwd) ?? "");', "/ticket add falls back to the plan's track");
+has("requested?.toLowerCase() !== INBOX_DIR", "/ticket add defaults to the inbox track");
 has('await writeFile(path, serializeTicketFile(ticket), "utf8");', "/ticket add writes a serialized ticket file");
 has("const target = await restoreTicket(rootDir, archived);", "/ticket restore moves an archived ticket back");
 has("export function archiveTicketPath(root: string, ticket: Pick<Ticket, \"track\" | \"path\">, date: Date | string = new Date()): string {", "archived tickets mirror their track under archive/<YYYY-MM>");
