@@ -727,7 +727,7 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 				const color = status === "running" ? "warning" : status === "done" ? "text" : status === "failed" || status === "cancelled" || status === "interrupted" ? "error" : "dim";
 				const branch = i === rows.length - 1 ? "└─" : "├─";
 				const label = `${icons[i]} ${truncateToWidth(row.label, titleWidth, "…", true)}`;
-				lines.push(theme.fg("dim", branch) + " " + theme.fg(color, label) + theme.fg(color, right(row)));
+				lines.push(theme.fg(color, branch) + " " + theme.fg(color, label) + theme.fg(color, right(row)));
 				// Live status lives on its own branch line so rail columns never shift as text arrives.
 				if (status === "running" && row.task?.latest) {
 					const prefix = i === rows.length - 1 ? "   " : "│  ";
@@ -739,10 +739,11 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 	};
 }
 
-// Live task text wraps inside the label column and re-emits the status rail divider, so the
-// running row never cuts off at the widget edge and the right column border stays continuous.
-const LIVE_LINE_CAP = 3;
+// Live task text uses the whole label column up to the status rail and re-emits its divider,
+// so the running row shows more of the child's line and clips at the rail, not mid-widget.
+const LIVE_LINE_CAP = 10;
 function liveTaskLines(latest: string, prefix: string, labelWidth: number): string[] {
+	// "↳ " or "  " gutter is 2 columns; the rest of the label column is live text.
 	const room = Math.max(8, labelWidth - 2);
 	const all = wrapTextWithAnsi(latest.trim(), room);
 	const chunks = all.slice(0, LIVE_LINE_CAP);
@@ -793,7 +794,7 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 				const color = status === "running" ? "warning" : status === "done" ? "text" : status === "failed" || status === "cancelled" || status === "interrupted" ? "error" : "dim";
 				const left = truncateToWidth(titles[i]!, titleWidth, "…", true);
 				const last = i === d.tasks.length - 1;
-				const prefix = theme.fg("dim", last ? "└─ " : "├─ ");
+				const prefix = theme.fg(color, last ? "└─ " : "├─ ");
 				if (status === "queued") {
 					lines.push(prefix + theme.fg("dim", left + queuedRail(task)));
 					return;
