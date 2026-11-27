@@ -1,18 +1,20 @@
 // Pure lean-flow plan/run contracts. Entry point: node --test tests/*.test.ts.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
-	appendIssue,
 	appendPlanStep,
+	archiveTicket,
+	archiveTicketPath,
 	branchSlug,
-	clearCompleted,
+	filterTickets,
 	migrateTracksMd,
-	parseIssueFile,
+	mintTicketId,
+	parseTicketFile,
 	parseTracks,
 	pathRefs,
 	planGoal,
@@ -21,9 +23,11 @@ import {
 	planStepsFromText,
 	planTrack,
 	readTracksTree,
+	restoreTicket,
 	reviewVerdict,
+	rewriteTicketStatus,
 	serializeIssueFile,
-	setIssueStatus,
+	serializeTicketFile,
 	shortPath,
 	runId,
 	slugify,
@@ -31,6 +35,8 @@ import {
 	taskFileName,
 	taskLabel,
 	tasksFromPlanText,
+	ticketFileName,
+	ticketIndexLines,
 } from "../lean-flow-plan.ts";
 
 const plan = `# Ship the widget
@@ -224,103 +230,6 @@ test("indented issue-looking detail stays with its open issue", () => {
 	]);
 });
 
-test("setIssueStatus flips one marker and keeps detail", () => {
-	const flipped = setIssueStatus(trackPlan, "widget-api", "Add test", "completed");
-	assert.deepEqual(
-		parseTracks(flipped)[0]!.issues.map((issue) => [issue.text, issue.status, issue.detail]),
-		[
-			["Add route", "pending", "Route detail line."],
-			["Add test", "completed", "Test detail."],
-			["Ship docs", "completed", "Docs detail."],
-		],
-	);
-	assert.equal(setIssueStatus(trackPlan, "missing", "Add test", "completed"), trackPlan);
-});
-
-test("appendIssue adds a pending issue under an existing track", () => {
-	const appended = appendIssue(trackPlan, "widget-ui", "Add tooltip", "Tooltip detail.\nSecond line.");
-	const ui = parseTracks(appended)[1]!;
-	assert.deepEqual(ui.issues.at(-1), { text: "Add tooltip", status: "pending", detail: "Tooltip detail.\nSecond line." });
-	assert.match(appended, /- \[x\] Wire button\n- \[ \] Add tooltip\n  Tooltip detail.\n  Second line.\n\n## done-track/);
-	assert.equal(appendIssue(trackPlan, "missing", "Nope"), trackPlan);
-});
-
-test("clearCompleted drops done issues plus detail and fully done tracks", () => {
-	assert.equal(clearCompleted(trackPlan), `# Plan
-
-Intro.
-
-## widget-api
-
-- [ ] Add route
-  Route detail line.
-- [-] Add test
-\tTest detail.
-
-## widget-ui
-
-- [ ] Render list
-`);
-});
-
-test("clearCompleted keeps lookalike-checkbox detail under a pending issue but drops it with a completed one", () => {
-	const plan = `## t
-
-- [ ] Keep me
-  - [x] Nested note
-  - [ ] Another note
-- [x] Drop me
-  - [x] Nested done
-`;
-	assert.equal(clearCompleted(plan), `## t
-
-- [ ] Keep me
-  - [x] Nested note
-  - [ ] Another note
-`);
-	assert.deepEqual(parseTracks(clearCompleted(plan))[0]!.issues, [
-		{ text: "Keep me", status: "pending", detail: "- [x] Nested note\n- [ ] Another note" },
-	]);
-});
-
-test("clearCompleted review repros and fully done tracks agree with parseTracks", () => {
-	// Repro: a completed issue above an open-looking detail drops both, not just the issue.
-	const completedAboveOpen = `## t
-
-- [x] Done
-  - [ ] open-looking detail
-- [ ] Next
-`;
-	assert.equal(clearCompleted(completedAboveOpen), `## t
-
-- [ ] Next
-`);
-
-	// Repro: a pending issue above a completed-looking detail keeps both.
-	const pendingAboveCompleted = `## t
-
-- [ ] Pending
-  - [x] done-looking detail
-`;
-	assert.equal(clearCompleted(pendingAboveCompleted), pendingAboveCompleted);
-
-	// A fully done track is dropped whole, even when its detail looks like an open issue.
-	const fullyDone = `## t
-
-- [x] Done
-  - [ ] open-looking detail
-
-## u
-
-- [ ] Keep
-`;
-	assert.equal(clearCompleted(fullyDone), `## u
-
-- [ ] Keep
-`);
-	assert.deepEqual(parseTracks(clearCompleted(fullyDone)).map((track) => track.name), ["u"]);
-});
-
 test("task labels strip markers and stopwords", () => {
 	assert.equal(taskLabel("Build the API [parallel]"), "Build API");
 	assert.equal(taskLabel("`wire` the **UI** [parallel:ui]"), "wire UI");
@@ -400,14 +309,14 @@ test("readTracksTree parses nested folders and issue files", () => {
 	const root = mkdtempSync(join(tmpdir(), "lean-tracks-"));
 	try {
 		mkdirSync(join(root, "area", "sub"), { recursive: true });
-		writeFileSync(join(root, "area", "sub", "fix-route.md"), "---\nstatus: doing\n---\n\n# Fix route\n\nRoute detail.\n");
-		writeFileSync(join(root, "area", "sub", "no-heading.md"), "---\nstatus: done\n---\n\nBody without heading.\n");
+		writeFileSync(join(root, "area", "sub", "bug-a1b2c3-fix-route.md"), "---\nstatus: started\n---\n\n# Fix route\n\nRoute detail.\n");
+		writeFileSync(join(root, "area", "sub", "feature-d4e5f6-no-heading.md"), "---\nstatus: done\n---\n\nBody without heading.\n");
 		writeFileSync(join(root, "area", "notes.txt"), "not an issue");
-		writeFileSync(join(root, "solo.md"), "# Solo issue\n");
+		writeFileSync(join(root, "rnd-abc123-solo.md"), "# Solo issue\n");
 
 		const tree = readTracksTree(root);
 		assert.deepEqual(tree.children.map((child) => child.name), ["area"]);
-		assert.deepEqual(tree.issues.map((issue) => issue.path), ["solo.md"]);
+		assert.deepEqual(tree.issues.map((issue) => issue.path), ["rnd-abc123-solo.md"]);
 
 		const area = tree.children[0]!;
 		assert.equal(area.path, "area");
@@ -416,26 +325,114 @@ test("readTracksTree parses nested folders and issue files", () => {
 
 		const sub = area.children[0]!;
 		assert.equal(sub.path, "area/sub");
-		assert.deepEqual(sub.issues.map((issue) => [issue.title, issue.status, issue.body, issue.path]), [
-			["Fix route", "doing", "Route detail.", "area/sub/fix-route.md"],
-			["no-heading", "done", "Body without heading.", "area/sub/no-heading.md"],
+		assert.deepEqual(sub.issues.map((issue) => [issue.id, issue.type, issue.title, issue.status, issue.body, issue.track, issue.path]), [
+			["a1b2c3", "bug", "Fix route", "started", "Route detail.", "area/sub", "area/sub/bug-a1b2c3-fix-route.md"],
+			["d4e5f6", "feature", "no-heading", "done", "Body without heading.", "area/sub", "area/sub/feature-d4e5f6-no-heading.md"],
 		]);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-test("issue file frontmatter status round-trips", () => {
-	for (const status of ["todo", "doing", "done"] as const) {
+test("ticket file frontmatter status round-trips", () => {
+	for (const status of ["todo", "started", "done"] as const) {
+		const path = "area/feature-abc123-round-trip.md";
 		const text = serializeIssueFile({ title: "Round trip", status, body: "First line.\n\nSecond line." });
-		const parsed = parseIssueFile(text, "ignored.md");
-		assert.deepEqual(parsed, { title: "Round trip", status, body: "First line.\n\nSecond line." });
+		const parsed = parseTicketFile(text, path);
+		assert.deepEqual(parsed, { id: "abc123", type: "feature", status, title: "Round trip", body: "First line.\n\nSecond line.", track: "area", path });
 		assert.equal(serializeIssueFile(parsed), text);
 	}
 
-	assert.deepEqual(parseIssueFile("# Title only\n", "file.md"), { title: "Title only", status: "todo", body: "" });
-	assert.deepEqual(parseIssueFile("plain body\n", "fallback.md"), { title: "fallback", status: "todo", body: "plain body" });
-	assert.equal(parseIssueFile("---\nstatus: blocked\n---\n# X\n", "x.md").status, "todo");
+	assert.deepEqual(parseTicketFile("# Title only\n", "bug-a1b2c3-title-only.md"), { id: "a1b2c3", type: "bug", status: "todo", title: "Title only", body: "", track: "", path: "bug-a1b2c3-title-only.md" });
+	assert.deepEqual(parseTicketFile("plain body\n", "feature-0a0b0c-fallback.md"), { id: "0a0b0c", type: "feature", status: "todo", title: "fallback", body: "plain body", track: "", path: "feature-0a0b0c-fallback.md" });
+	assert.equal(parseTicketFile("---\nstatus: blocked\n---\n# X\n", "rnd-ffffff-x.md").status, "todo");
+});
+
+test("ticket filenames mint and parse round-trip", () => {
+	const id = mintTicketId();
+	assert.match(id, /^[0-9a-f]{6}$/);
+
+	const name = ticketFileName({ type: "bug", id, title: "Fix the route: now!" });
+	assert.equal(name, `bug-${id}-fix-the-route-now.md`);
+	const text = serializeTicketFile({ type: "bug", status: "started", title: "Fix the route: now!", body: "Route body." });
+	assert.deepEqual(parseTicketFile(text, `area/${name}`), {
+		id,
+		type: "bug",
+		status: "started",
+		title: "Fix the route: now!",
+		body: "Route body.",
+		track: "area",
+		path: `area/${name}`,
+	});
+
+	const used = { name: "", path: "", children: [], issues: [parseTicketFile(text, name)] };
+	assert.match(mintTicketId(used), /^[0-9a-f]{6}$/);
+	assert.equal(new Set(Array.from({ length: 100 }, () => mintTicketId())).size, 100);
+});
+
+test("rewriteTicketStatus keeps extra frontmatter keys, CRLF, and body bytes", () => {
+	const text = "---\r\nstatus: todo\r\ntype: bug\r\n---\r\n\r\n# Fix route\r\n\r\nBody line.\r\n";
+	const rewritten = rewriteTicketStatus(text, "done");
+	assert.equal(rewritten, "---\r\nstatus: done\r\ntype: bug\r\n---\r\n\r\n# Fix route\r\n\r\nBody line.\r\n");
+	assert.equal(parseTicketFile(rewritten, "bug-a1b2c3-fix-route.md").status, "done");
+	assert.equal(parseTicketFile(rewritten, "bug-a1b2c3-fix-route.md").body, "Body line.");
+
+	assert.equal(rewriteTicketStatus("---\ntype: feature\n---\n\n# A\n", "started"), "---\nstatus: started\ntype: feature\n---\n\n# A\n");
+	assert.equal(rewriteTicketStatus("# A\n", "todo"), "---\nstatus: todo\n---\n# A\n");
+});
+
+test("filterTickets combines track prefixes with type, status, and id prefixes", () => {
+	const ticket = (path: string, title: string, status: "todo" | "started" | "done") => parseTicketFile(`---\nstatus: ${status}\n---\n\n# ${title}\n`, path, path.split("/").slice(0, -1).join("/"));
+	const tree = {
+		name: "",
+		path: "",
+		issues: [ticket("feature-aaa111-root.md", "Root", "todo")],
+		children: [{
+			name: "area",
+			path: "area",
+		issues: [ticket("area/bug-bbb222-area.md", "Area bug", "started"), ticket("area/rnd-ccc333-done.md", "Area rnd", "done")],
+			children: [{ name: "sub", path: "area/sub", issues: [ticket("area/sub/feature-ddd444-sub.md", "Sub", "todo")], children: [] }],
+		}],
+	};
+	const paths = (filters: Parameters<typeof filterTickets>[1]) => filterTickets(tree, filters).map((ticket) => ticket.path);
+
+	assert.deepEqual(paths({}), ["feature-aaa111-root.md", "area/bug-bbb222-area.md", "area/rnd-ccc333-done.md", "area/sub/feature-ddd444-sub.md"]);
+	assert.deepEqual(paths({ track: "area" }), ["area/bug-bbb222-area.md", "area/rnd-ccc333-done.md", "area/sub/feature-ddd444-sub.md"]);
+	assert.deepEqual(paths({ track: "/area/sub/" }), ["area/sub/feature-ddd444-sub.md"]);
+	assert.deepEqual(paths({ type: "bug" }), ["area/bug-bbb222-area.md"]);
+	assert.deepEqual(paths({ status: "todo" }), ["feature-aaa111-root.md", "area/sub/feature-ddd444-sub.md"]);
+	assert.deepEqual(paths({ id: "#ccc" }), ["area/rnd-ccc333-done.md"]);
+	assert.deepEqual(paths({ idPrefix: "ddd", track: "area/sub", type: "feature" }), ["area/sub/feature-ddd444-sub.md"]);
+	assert.deepEqual(paths({ track: "area", type: "rnd" }), ["area/rnd-ccc333-done.md"]);
+	assert.deepEqual(paths({ type: "bug", status: "todo" }), []);
+
+	const all = filterTickets(tree);
+	assert.equal(ticketIndexLines(all, 2), "feature aaa111 todo (root) Root\nbug bbb222 started area Area bug\n…2 more");
+	assert.equal(ticketIndexLines([all[0]!], 5), "feature aaa111 todo (root) Root");
+	assert.equal(ticketIndexLines(all, 0), "…4 more");
+});
+
+test("archive helpers mirror the track and restore recreates folders", async () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-archive-"));
+	try {
+		const ticket = { track: "area/sub", path: "area/sub/bug-a1b2c3-fix-route.md" };
+		const archived = archiveTicketPath(root, ticket, new Date("2026-11-05T00:00:00Z"));
+		assert.equal(archived, join(root, "archive", "2026-11", "area", "sub", "bug-a1b2c3-fix-route.md"));
+		assert.equal(archiveTicketPath(root, { track: "", path: "rnd-abc123-solo.md" }, "2026-11-05T00:00:00Z"), join(root, "archive", "2026-11", "rnd-abc123-solo.md"));
+
+		mkdirSync(join(root, "area", "sub"), { recursive: true });
+		writeFileSync(join(root, ...ticket.path.split("/")), "ticket");
+		assert.equal(await archiveTicket(root, ticket, new Date("2026-11-05T00:00:00Z")), archived);
+		assert.equal(existsSync(join(root, ...ticket.path.split("/"))), false);
+		assert.equal(readFileSync(archived, "utf8"), "ticket");
+
+		const archivedTicket = { track: "archive/2026-11/area/sub", path: "archive/2026-11/area/sub/bug-a1b2c3-fix-route.md" };
+		const restored = await restoreTicket(root, archivedTicket);
+		assert.equal(restored, join(root, "area", "sub", "bug-a1b2c3-fix-route.md"));
+		assert.equal(readFileSync(restored, "utf8"), "ticket");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("readTracksTree keeps empty folders as tracks", () => {
@@ -479,15 +476,48 @@ test("migrateTracksMd writes folders and issue files with detail", async () => {
 
 		const tree = readTracksTree(tracksDir);
 		assert.deepEqual(tree.children.map((child) => child.name), ["area", "widget-api"]);
-		assert.deepEqual(tree.children[0]!.children[0]!.issues.map((issue) => [issue.title, issue.status, issue.body]), [
-			["Nested issue", "todo", "Nested detail."],
+		assert.deepEqual(tree.children[0]!.children[0]!.issues.map((issue) => [issue.type, issue.title, issue.status, issue.body]), [
+			["feature", "Nested issue", "todo", "Nested detail."],
 		]);
-		assert.deepEqual(tree.children[1]!.issues.map((issue) => [issue.title, issue.status, issue.body, issue.path]), [
-			["Add route", "todo", "Route detail line.\nSecond route line.", "widget-api/add-route.md"],
-			["Add test", "doing", "Tabbed detail.", "widget-api/add-test.md"],
-			["Ship docs", "done", "", "widget-api/ship-docs.md"],
+		const issues = new Map(tree.children[1]!.issues.map((issue) => [issue.title, issue]));
+		assert.deepEqual([...issues.values()].sort((a, b) => a.title.localeCompare(b.title)).map((issue) => [issue.type, issue.title, issue.status, issue.body]), [
+			["feature", "Add route", "todo", "Route detail line.\nSecond route line."],
+			["feature", "Add test", "started", "Tabbed detail."],
+			["feature", "Ship docs", "done", ""],
 		]);
-		assert.match(readFileSync(join(tracksDir, "widget-api", "add-route.md"), "utf8"), /^---\nstatus: todo\n---\n\n# Add route\n\nRoute detail line\.\nSecond route line\.\n$/);
+		assert.match(issues.get("Add route")!.path, /^widget-api\/feature-[0-9a-f]{6}-add-route\.md$/);
+		assert.match(issues.get("Add test")!.path, /^widget-api\/feature-[0-9a-f]{6}-add-test\.md$/);
+		assert.match(issues.get("Ship docs")!.path, /^widget-api\/feature-[0-9a-f]{6}-ship-docs\.md$/);
+		assert.match(readFileSync(join(tracksDir, issues.get("Add route")!.path), "utf8"), /^---\nstatus: todo\ntype: feature\n---\n\n# Add route\n\nRoute detail line\.\nSecond route line\.\n$/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("migrateTracksMd renames legacy slug tickets once and keeps typed files", async () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-rename-"));
+	try {
+		const tracksDir = join(root, ".pi", "tracks");
+		mkdirSync(join(tracksDir, "area"), { recursive: true });
+		writeFileSync(join(tracksDir, "area", "old-note.md"), "---\nstatus: started\n---\n\n# Old note\n\nLegacy body.\n");
+		writeFileSync(join(tracksDir, "area", "feature-abcdef-keep.md"), "# Keep\n");
+
+		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), true);
+		const names = readdirSync(join(tracksDir, "area")).sort();
+		assert.equal(names.length, 2);
+		assert.ok(names.includes("feature-abcdef-keep.md"));
+		const renamed = names.find((name) => name !== "feature-abcdef-keep.md")!;
+		assert.match(renamed, /^feature-[0-9a-f]{6}-old-note\.md$/);
+		assert.deepEqual(readTracksTree(tracksDir).children[0]!.issues.find((issue) => issue.id !== "abcdef"), {
+			id: renamed.slice(8, 14),
+			type: "feature",
+			status: "started",
+			title: "Old note",
+			body: "Legacy body.",
+			track: "area",
+			path: `area/${renamed}`,
+		});
+		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), false, "second run is a no-op");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

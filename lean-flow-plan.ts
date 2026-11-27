@@ -1,10 +1,13 @@
-// Pure plan/run helpers for lean-flow. Entry points: branchSlug, tasksFromPlanText, parseTracks,
-// parseIssueFile, readTracksTree, migrateTracksMd, reviewVerdict.
-// No Pi imports so tests/*.test.ts can run under plain `node --test`.
+// Pure lean-flow helpers: plan/run parsing plus tracks-tree and ticket file IO. Entry points are
+// plan/run (tasksFromPlanText, branchSlug, reviewVerdict) and tracks/tickets (parseTracks,
+// parseTicketFile, readTracksTree, filterTickets, archive/restore/migrate ticket). No Pi imports so
+// tests/*.test.ts run under plain `node --test`. Split trigger: move ticket read/write/archive/migrate
+// into lean-flow-tickets.ts once ticket IO outgrows parsing.
 
+import { randomBytes } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, rename, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 export type LeanAgent = "worker" | "reviewer" | "researcher";
 
@@ -177,7 +180,6 @@ const TRACK_HEADING = /^##[ \t]+(.+?)[ \t]*$/;
 const TRACK_ISSUE = /^(\s*-\s+\[)([ xX-])(\]\s+.*)$/;
 const TRACK_DETAIL = /^(?:\t| {2,})\S/;
 const MARKER_STATUS: Record<string, TrackStatus> = { " ": "pending", "-": "started", x: "completed" };
-const STATUS_MARKER: Record<TrackStatus, string> = { pending: " ", started: "-", completed: "x" };
 
 function issueStatus(marker: string): TrackStatus {
 	return MARKER_STATUS[marker.toLowerCase()] ?? "pending";
@@ -185,10 +187,6 @@ function issueStatus(marker: string): TrackStatus {
 
 function linesOf(text: string): string[] {
 	return text.split(/\r?\n/);
-}
-
-function eolOf(text: string): string {
-	return text.includes("\r\n") ? "\r\n" : "\n";
 }
 
 // Ponytail ceiling: flat `## track` headings with `- [ ]`/`- [-]`/`- [x]` issues and indented detail only;
@@ -219,42 +217,114 @@ export function parseTracks(text: string): Track[] {
 	return tracks;
 }
 
-// Folder-based tracks: every subfolder is a track, every `*.md` file is an issue file.
-export type IssueStatus = "todo" | "doing" | "done";
-export type TrackIssueFile = { title: string; status: IssueStatus; body: string; path: string };
-export type TrackNode = { name: string; path: string; children: TrackNode[]; issues: TrackIssueFile[] };
+// Folder-based tracks: every subfolder is a track, every `*.md` file is a ticket.
+export type TicketType = "bug" | "feature" | "rnd";
+export type TicketStatus = "todo" | "started" | "done";
+export type Ticket = {
+	id: string;
+	type: TicketType;
+	status: TicketStatus;
+	title: string;
+	body: string;
+	track: string;
+	path: string;
+};
+export type TrackNode = { name: string; path: string; children: TrackNode[]; issues: Ticket[] };
 
-const MIGRATED_STATUS: Record<TrackStatus, IssueStatus> = { pending: "todo", started: "doing", completed: "done" };
+const MIGRATED_STATUS: Record<TrackStatus, TicketStatus> = { pending: "todo", started: "started", completed: "done" };
+const TICKET_FILE = /^(bug|feature|rnd)-([0-9a-f]{6})-(.*)\.md$/i;
 
 function baseName(path: string): string {
 	return path.split(/[/\\]/).filter(Boolean).pop() ?? path;
 }
 
-function isIssueStatus(value: string | undefined): value is IssueStatus {
-	return value === "todo" || value === "doing" || value === "done";
+function ticketTrack(path: string): string {
+	return path.split(/[/\\]/).slice(0, -1).filter((segment) => segment && segment !== ".").join("/");
 }
 
-// Title = first `# ` heading, else the filename without `.md`. Status = frontmatter `status:`,
-// limited to todo/doing/done (default todo). Body = the markdown left after both are removed.
-export function parseIssueFile(text: string, filename: string): { title: string; status: IssueStatus; body: string } {
+function isTicketStatus(value: string | undefined): value is TicketStatus {
+	return value === "todo" || value === "started" || value === "done";
+}
+
+// Filename = `<type>-<id>-<slug>.md`; legacy `<slug>.md` reads as feature with no id until migrated.
+// Status = frontmatter `status:` limited to todo/started/done (default todo).
+// Title = first `# ` heading, else the filename slug. Body = the markdown left after both are removed.
+export function parseTicketFile(text: string, path: string, track = ticketTrack(path)): Ticket {
 	const source = text.replace(/^\uFEFF/, "");
 	const frontmatter = source.match(/^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/);
 	const rawStatus = frontmatter?.[1]
 		.split(/\r?\n/)
 		.map((line) => line.match(/^\s*status\s*:\s*(.+?)\s*$/i)?.[1]?.replace(/^["']|["']$/g, "").toLowerCase())
 		.find(Boolean);
+	const filename = baseName(path);
+	const match = filename.match(TICKET_FILE);
+	const type = (match?.[1]?.toLowerCase() as TicketType | undefined) ?? "feature";
+	const id = match?.[2]?.toLowerCase() ?? "";
+	const slug = match?.[3] ?? filename.replace(/\.md$/i, "");
 	const rest = frontmatter ? source.slice(frontmatter[0].length) : source;
 	const lines = rest.split(/\r?\n/);
 	const heading = lines.findIndex((line) => /^#[ \t]+\S/.test(line));
-	const title = heading >= 0 ? lines[heading]!.replace(/^#[ \t]+/, "").trim() : baseName(filename).replace(/\.md$/i, "");
+	const title = heading >= 0 ? lines[heading]!.replace(/^#[ \t]+/, "").trim() : slug;
 	if (heading >= 0) lines.splice(heading, 1);
-	return { title, status: isIssueStatus(rawStatus) ? rawStatus : "todo", body: lines.join("\n").trim() };
+	return { id, type, status: isTicketStatus(rawStatus) ? rawStatus : "todo", title, body: lines.join("\n").trim(), track, path };
 }
 
-export function serializeIssueFile(issue: { title: string; status: IssueStatus; body?: string }): string {
+export function serializeIssueFile(issue: { title: string; status: TicketStatus; body?: string }): string {
 	const title = issue.title.trim();
 	const body = (issue.body ?? "").trim();
 	return `---\nstatus: ${issue.status}\n---\n\n# ${title}${body ? `\n\n${body}` : ""}\n`;
+}
+
+function ticketIds(node: TrackNode, ids = new Set<string>()): Set<string> {
+	for (const ticket of node.issues) ids.add(ticket.id);
+	for (const child of node.children) ticketIds(child, ids);
+	return ids;
+}
+
+const EMPTY_TREE: TrackNode = { name: "", path: "", children: [], issues: [] };
+
+function uniqueTicketId(used: Set<string>): string {
+	let id: string;
+	do id = randomBytes(3).toString("hex"); while (used.has(id));
+	used.add(id);
+	return id;
+}
+
+// Random 6-hex ticket id, retried until it does not collide with any ticket already in the tree.
+export function mintTicketId(tree: TrackNode = EMPTY_TREE): string {
+	return uniqueTicketId(ticketIds(tree));
+}
+
+export function ticketFileName(ticket: Pick<Ticket, "type" | "id" | "title">): string {
+	return `${ticket.type}-${ticket.id}-${slugify(ticket.title, 60)}.md`;
+}
+
+// Frontmatter carries status and type; the title heading and body are written as-is (trimmed edges).
+export function serializeTicketFile(ticket: Pick<Ticket, "type" | "status" | "title" | "body">): string {
+	const title = ticket.title.trim();
+	const body = ticket.body.trim();
+	return `---\nstatus: ${ticket.status}\ntype: ${ticket.type}\n---\n\n# ${title}${body ? `\n\n${body}` : ""}\n`;
+}
+
+const STATUS_LINE = /^([ \t]*status[ \t]*:[ \t]*)(.*?)([ \t]*)(?=\r?\n|$)/im;
+
+// Rewrite only the frontmatter `status:` value: every other key, line ending and body byte stays
+// intact. A missing status line is inserted first; text without frontmatter gets one prepended.
+export function rewriteTicketStatus(text: string, status: TicketStatus): string {
+	const bom = text.startsWith("\uFEFF") ? "\uFEFF" : "";
+	const source = text.slice(bom.length);
+	const frontmatter = source.match(/^(---[ \t]*)(\r?\n)((?:[\s\S]*?\r?\n)?)(---[ \t]*)(?=\r?\n|$)/);
+	const eol = source.includes("\r\n") ? "\r\n" : "\n";
+	if (!frontmatter) return `${bom}---${eol}status: ${status}${eol}---${eol}${source}`;
+	const open = frontmatter[1]!;
+	const openEol = frontmatter[2]!;
+	const inner = frontmatter[3]!;
+	const close = frontmatter[4]!;
+	const insertEol = inner.match(/\r?\n/)?.[0] ?? openEol;
+	const nextInner = STATUS_LINE.test(inner)
+		? inner.replace(STATUS_LINE, (_match, prefix: string, _value: string, trailing: string) => `${prefix}${status}${trailing}`)
+		: `status: ${status}${inner ? insertEol : openEol}${inner}`;
+	return `${bom}${open}${openEol}${nextInner}${close}${source.slice(frontmatter[0].length)}`;
 }
 
 function readTrackDir(dir: string, name: string, path: string): TrackNode {
@@ -265,7 +335,7 @@ function readTrackDir(dir: string, name: string, path: string): TrackNode {
 		const childPath = path ? `${path}/${entry.name}` : entry.name;
 		if (entry.isDirectory()) node.children.push(readTrackDir(join(dir, entry.name), entry.name, childPath));
 		else if (entry.isFile() && /\.md$/i.test(entry.name)) {
-			node.issues.push({ ...parseIssueFile(readFileSync(join(dir, entry.name), "utf8"), entry.name), path: childPath });
+			node.issues.push(parseTicketFile(readFileSync(join(dir, entry.name), "utf8"), childPath));
 		}
 	}
 	return node;
@@ -276,118 +346,130 @@ export function readTracksTree(root: string): TrackNode {
 	return readTrackDir(root, baseName(root), "");
 }
 
-// One-shot `tracks.md` -> folders + issue files. Skips when there is no source or the target is
-// already populated, and never deletes `tracks.md` (humans compare before deleting it).
+export type TicketFilters = { track?: string; type?: TicketType; status?: TicketStatus; id?: string; idPrefix?: string };
+
+function walkTickets(node: TrackNode, visit: (ticket: Ticket) => void): void {
+	for (const ticket of node.issues) visit(ticket);
+	for (const child of node.children) walkTickets(child, visit);
+}
+
+// Track is a prefix (`area` also matches `area/sub`); id is a prefix; all filters combine with AND.
+export function filterTickets(tree: TrackNode, filters: TicketFilters = {}): Ticket[] {
+	const track = filters.track?.replace(/^[/\\]+|[/\\]+$/g, "").toLowerCase();
+	const type = filters.type?.toLowerCase();
+	const status = filters.status?.toLowerCase();
+	const id = (filters.idPrefix ?? filters.id)?.replace(/^#/, "").toLowerCase();
+	const tickets: Ticket[] = [];
+	walkTickets(tree, (ticket) => {
+		const ticketTrackName = ticket.track.toLowerCase();
+		if (track && ticketTrackName !== track && !ticketTrackName.startsWith(`${track}/`)) return;
+		if (type && ticket.type.toLowerCase() !== type) return;
+		if (status && ticket.status.toLowerCase() !== status) return;
+		if (id && !ticket.id.toLowerCase().startsWith(id)) return;
+		tickets.push(ticket);
+	});
+	return tickets;
+}
+
+// One compact ranking line per ticket so a planner can pick ids without reading bodies.
+export function ticketIndexLines(tickets: Ticket[], cap = 200): string {
+	const shown = tickets.slice(0, Math.max(0, cap));
+	const lines = shown.map((ticket) => `${ticket.type} ${ticket.id} ${ticket.status} ${ticket.track || "(root)"} ${ticket.title}`);
+	const hidden = tickets.length - shown.length;
+	if (hidden > 0) lines.push(`…${hidden} more`);
+	return lines.join("\n");
+}
+
+// Open = not done. Counts are per exact track path; root-level tickets use `(root)`.
+export function ticketCounts(tree: TrackNode): Record<string, number> {
+	const counts: Record<string, number> = {};
+	walkTickets(tree, (ticket) => {
+		if (ticket.status === "done") return;
+		const track = ticket.track || "(root)";
+		counts[track] = (counts[track] ?? 0) + 1;
+	});
+	return counts;
+}
+
+// Top-level `archive` is reserved: done tickets mirror their track under archive/<YYYY-MM>/.
+export const ARCHIVE_DIR = "archive";
+
+export function archiveDir(root: string): string {
+	return join(root, ARCHIVE_DIR);
+}
+
+function pathSegments(path: string): string[] {
+	return path.split(/[/\\]/).filter((segment) => segment && segment !== "." && segment !== "..");
+}
+
+function archiveMonth(date: Date | string): string {
+	const iso = typeof date === "string" ? date : date.toISOString();
+	return iso.match(/^(\d{4})-(\d{2})/)?.[0] ?? iso.slice(0, 7);
+}
+
+// Archive path mirrors the ticket's track under archive/<YYYY-MM>/; root tickets sit directly there.
+export function archiveTicketPath(root: string, ticket: Pick<Ticket, "track" | "path">, date: Date | string = new Date()): string {
+	return join(archiveDir(root), archiveMonth(date), ...pathSegments(ticket.track), baseName(ticket.path));
+}
+
+// Move a ticket under its mirrored archive path.
+export async function archiveTicket(root: string, ticket: Pick<Ticket, "track" | "path">, date: Date | string = new Date()): Promise<string> {
+	const source = join(root, ...pathSegments(ticket.path));
+	const target = archiveTicketPath(root, ticket, date);
+	await mkdir(dirname(target), { recursive: true });
+	await rename(source, target);
+	return target;
+}
+
+// Move an archived ticket back under its original track, recreating missing folders.
+export async function restoreTicket(root: string, ticket: Pick<Ticket, "path" | "track">): Promise<string> {
+	const source = join(root, ...pathSegments(ticket.path));
+	const segments = pathSegments(ticket.path);
+	const original = segments[0] === ARCHIVE_DIR && /^\d{4}-\d{2}$/.test(segments[1] ?? "") ? segments.slice(2) : segments;
+	const target = join(root, ...original);
+	await mkdir(dirname(target), { recursive: true });
+	await rename(source, target);
+	return target;
+}
+
+// Rename legacy `<slug>.md` tickets in place, minting a 6-hex id and keeping the track folder.
+async function renameLegacyTickets(dir: string, used: Set<string>): Promise<boolean> {
+	if (!existsSync(dir)) return false;
+	let changed = false;
+	for (const entry of readdirSync(dir, { withFileTypes: true })) {
+		const path = join(dir, entry.name);
+		if (entry.isDirectory()) changed = (await renameLegacyTickets(path, used)) || changed;
+		else if (entry.isFile() && /\.md$/i.test(entry.name) && !TICKET_FILE.test(entry.name)) {
+			const ticket = parseTicketFile(readFileSync(path, "utf8"), path);
+			const target = join(dir, ticketFileName({ type: ticket.type, id: uniqueTicketId(used), title: ticket.title }));
+			await rename(path, target);
+			changed = true;
+		}
+	}
+	return changed;
+}
+
+// One-shot `tracks.md` -> folders + typed ticket files, plus an in-place rename pass for legacy
+// `<slug>.md` tickets. Never deletes `tracks.md` (humans compare before deleting it).
 export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<boolean> {
-	if (!existsSync(tracksMdPath)) return false;
+	let changed = await renameLegacyTickets(tracksDir, ticketIds(readTracksTree(tracksDir)));
+	if (!existsSync(tracksMdPath)) return changed;
 	try {
-		if (readdirSync(tracksDir).length) return false;
+		if (readdirSync(tracksDir).length) return changed;
 	} catch {}
 	const tracks = parseTracks(readFileSync(tracksMdPath, "utf8"));
 	if (!tracks.length) return false;
-	const used = new Map<string, Set<string>>();
+	const used = new Set<string>();
 	for (const track of tracks) {
 		const segments = track.name.split("/").map((segment) => segment.trim()).filter((segment) => segment && segment !== "." && segment !== "..");
 		const dir = segments.length ? join(tracksDir, ...segments) : tracksDir;
 		await mkdir(dir, { recursive: true });
-		const names = used.get(dir) ?? new Set<string>();
-		used.set(dir, names);
 		for (const issue of track.issues) {
-			const base = slugify(issue.text, 60);
-			let file = `${base}.md`;
-			for (let n = 2; names.has(file); n++) file = `${base}-${n}.md`;
-			names.add(file);
-			await writeFile(join(dir, file), serializeIssueFile({ title: issue.text, status: MIGRATED_STATUS[issue.status], body: issue.detail }), "utf8");
+			const ticket = { type: "feature" as const, id: uniqueTicketId(used), title: issue.text, status: MIGRATED_STATUS[issue.status], body: issue.detail };
+			await writeFile(join(dir, ticketFileName(ticket)), serializeTicketFile(ticket), "utf8");
 		}
 	}
 	return true;
-}
-
-type IssueRef = number | string | Pick<TrackIssue, "text">;
-
-function matchesIssue(text: string, index: number, ref: IssueRef): boolean {
-	if (typeof ref === "number") return index === ref;
-	return text === (typeof ref === "string" ? ref : ref.text);
-}
-
-// Change one marker only; the issue text, its detail lines, and every other line stay byte-identical.
-export function setIssueStatus(text: string, trackName: string, issueRef: IssueRef, status: TrackStatus): string {
-	const lines = linesOf(text);
-	let track: string | undefined;
-	let seen = 0;
-	for (let index = 0; index < lines.length; index++) {
-		const line = lines[index]!;
-		const heading = line.match(TRACK_HEADING);
-		if (heading) {
-			track = heading[1]!.trim();
-			continue;
-		}
-		const found = track === trackName.trim() && line.match(TRACK_ISSUE);
-		if (!found) continue;
-		const issueText = found[3]!.replace(/^\]\s+/, "").trim();
-		if (!matchesIssue(issueText, seen++, issueRef)) continue;
-		lines[index] = found[1]! + STATUS_MARKER[status] + found[3]!;
-		return lines.join(eolOf(text));
-	}
-	return text;
-}
-
-// Append a pending issue after the track's last issue/detail block. Unknown tracks are left untouched.
-export function appendIssue(text: string, trackName: string, issueText: string, detail = ""): string {
-	const lines = linesOf(text);
-	const heading = lines.findIndex((line) => line.match(TRACK_HEADING)?.[1]?.trim() === trackName.trim());
-	if (heading < 0) return text;
-	let insert = heading + 1;
-	for (let index = heading + 1; index < lines.length; index++) {
-		const line = lines[index]!;
-		if (TRACK_HEADING.test(line)) break;
-		if (TRACK_ISSUE.test(line)) insert = index + 1;
-		else if (insert > heading + 1 && TRACK_DETAIL.test(line)) insert = index + 1;
-	}
-	const added = [`- [ ] ${issueText.trim()}`, ...detail.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).map((line) => `  ${line}`)];
-	lines.splice(insert, 0, ...added);
-	return lines.join(eolOf(text));
-}
-
-// Classify block lines the way parseTracks does: an indented line stays detail while an issue is open,
-// even when it looks like `  - [x] note`, so detail never surfaces as a top-level issue.
-function classifyLines(lines: string[]): { line: string; issue?: TrackStatus; detail: boolean }[] {
-	let open: TrackStatus | undefined;
-	return lines.map((line) => {
-		if (open && TRACK_DETAIL.test(line)) return { line, issue: open, detail: true };
-		const found = line.match(TRACK_ISSUE);
-		if (found) {
-			open = issueStatus(found[2]!);
-			return { line, issue: open, detail: false };
-		}
-		open = undefined;
-		return { line, detail: false };
-	});
-}
-
-// Drop fully completed tracks and completed issues plus their detail blocks; unrelated lines stay as-is.
-export function clearCompleted(text: string): string {
-	const lines = linesOf(text);
-	const out: string[] = [];
-	for (let start = 0; start < lines.length; ) {
-		const isTrack = TRACK_HEADING.test(lines[start]!);
-		let end = start + 1;
-		while (end < lines.length && !TRACK_HEADING.test(lines[end]!)) end++;
-		const block = lines.slice(start, end);
-		const classified = classifyLines(block.slice(isTrack ? 1 : 0));
-		const issueLines = classified.filter((entry) => entry.issue && !entry.detail);
-		if (isTrack && issueLines.length && issueLines.every((entry) => entry.issue === "completed")) {
-			start = end;
-			continue;
-		}
-		if (isTrack) out.push(block[0]!);
-		for (const entry of classified) {
-			if (entry.issue === "completed") continue;
-			out.push(entry.line);
-		}
-		start = end;
-	}
-	return out.join(eolOf(text));
 }
 
 export function tasksFromPlanText(text: string | undefined, args: string, resumeFrom?: string, skipSteps: string[] = []): LeanTask[] {

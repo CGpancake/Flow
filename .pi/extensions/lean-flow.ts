@@ -12,29 +12,40 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
 	appendPlanStep,
+	archiveTicket,
+	ARCHIVE_DIR,
 	branchSlug,
+	filterTickets,
 	migrateTracksMd,
+	mintTicketId,
 	PLAN_HEADING,
 	planGoal,
 	planStepCount,
 	planStepsFromText,
 	planTrack,
-	parseIssueFile,
+	parseTicketFile,
 	pathRefs,
 	readTracksTree,
+	restoreTicket,
 	reviewVerdict,
+	rewriteTicketStatus,
 	runId as makeRunId,
-	serializeIssueFile,
+	serializeTicketFile,
 	slugify,
 	staleRunIds,
 	taskFileName,
 	taskLabel,
 	tasksFromPlanText,
-	type IssueStatus,
+	ticketCounts,
+	ticketFileName,
+	ticketIndexLines,
 	type LeanAgent,
 	type LeanTask,
 	type PlanStep,
-	type TrackIssueFile,
+	type Ticket,
+	type TicketFilters,
+	type TicketStatus,
+	type TicketType,
 	type TrackNode,
 } from "../../lean-flow-plan.ts";
 
@@ -237,6 +248,11 @@ function padRightVisible(text: string, width: number): string {
 	return text + " ".repeat(Math.max(0, width - visibleWidth(text)));
 }
 
+// Keeps only the newest slice of a streamed delta run so widget refreshes stay cheap.
+function tailText(text: string, delta: unknown): string {
+	return `${text}${typeof delta === "string" ? delta : ""}`.slice(-600);
+}
+
 function compactDuration(ms: number): string {
 	const seconds = Math.max(0, Math.round(ms / 1000));
 	const minutes = Math.floor(seconds / 60);
@@ -306,6 +322,8 @@ async function runPiChild(ctx: ExtensionContext, task: LeanTask, contextWindow: 
 	const feed: string[] = [];
 	let output = "";
 	let live = "starting sdk child";
+	// Tail of the child's streamed thinking/text so the widget shows real words, not a phase label.
+	let streamed = "";
 	let phase = "starting";
 	const events: Record<string, number> = {};
 	const textBlocks = (content: any) => Array.isArray(content)
@@ -366,17 +384,19 @@ async function runPiChild(ctx: ExtensionContext, task: LeanTask, contextWindow: 
 		bump(event.type ?? "event");
 		updateContext(session);
 		if (event.type === "agent_start") { phase = "agent starting"; live = "agent starting"; addFeed(live); publish(); }
-		if (event.type === "turn_start") { phase = "thinking"; live = "thinking..."; addFeed(live); publish(); }
+		if (event.type === "turn_start") { phase = "thinking"; live = "thinking..."; streamed = ""; addFeed(live); publish(); }
 		if (event.type === "message_update") {
 			const ae = event.assistantMessageEvent;
 			bump(ae?.type ?? "message_delta");
-			if (ae?.type === "thinking_delta") { phase = "thinking"; live = "thinking..."; }
-			else if (ae?.type === "text_delta") { phase = "responding"; live = "responding..."; }
-			else if (ae?.type?.startsWith?.("toolcall")) { phase = "preparing tool"; live = `preparing ${ae.toolCall?.name ?? "tool"}...`; }
+			if (ae?.type === "thinking_delta") { phase = "thinking"; streamed = tailText(streamed, ae.delta); live = streamed; }
+			else if (ae?.type === "text_delta") { phase = "responding"; streamed = tailText(streamed, ae.delta); live = streamed; }
+			else if (ae?.type?.startsWith?.("toolcall")) { phase = "preparing tool"; live = `preparing ${ae.toolCall?.name ?? ae.toolName ?? "tool"}...`; }
+			else if (ae?.type?.endsWith?.("_end")) { phase = "model event"; }
 			else { phase = "model event"; live = ae?.type ?? "model event"; }
 			publish();
 		}
 		if (event.type === "tool_execution_start") {
+			streamed = "";
 			if ((event.toolName === "write" || event.toolName === "edit") && typeof event.args?.path === "string") onWrite?.(event.args.path);
 			phase = `running ${event.toolName}`;
 			live = `running ${event.toolName}...\n${JSON.stringify(event.args ?? {})}`;
@@ -569,15 +589,39 @@ function planAddPrompt(current: string, scope: string): string {
 }
 
 async function startPlan(pi: ExtensionAPI, ctx: ExtensionContext, input: string): Promise<void> {
-	const name = input.match(/^track\s+(.+)$/i)?.[1]?.trim();
-	const track = name ? await trackScope(ctx.cwd, name) : undefined;
-	if (name && !track) {
-		await unknownTrack(ctx, name);
+	const { filters, rest } = parseTicketFilters(input);
+	const guidance = rest.join(" ");
+	const hasFilter = Boolean(filters.track || filters.type || filters.status || filters.idPrefix);
+	if (!hasFilter) {
+		send(pi, planPrompt(guidance || "Use the current conversation goal."));
 		return;
 	}
-	const scope = track
-		? `Work the "${track.name}" track from .pi/tracks/. Emit exactly one numbered implementation step per open issue (status todo or doing); skip done issues. Carry an indented \`Track: ${track.name}\` line and an \`Issue: <issue title>\` line under each step, and use the issue body to shape the step. Issues:\n${track.issues}`
-		: input || "Use the current conversation goal.";
+	const rootDir = await ensureTracks(ctx.cwd);
+	const tree = readTracksTree(rootDir);
+	const track = filters.track ? findTrack(tree, filters.track) : undefined;
+	if (filters.track && !track) {
+		await unknownTrack(ctx, filters.track);
+		return;
+	}
+	if (track) filters.track = track.path;
+	if ((filters.type && !TICKET_TYPES.includes(filters.type)) || (filters.status && !TICKET_STATUSES.includes(filters.status))) {
+		notifyPlanFilter(ctx, filters, tree);
+		return;
+	}
+	const includeClosed = filters.status === "done";
+	const matches = filterTickets(tree, filters).filter((ticket) => includeClosed || (ticket.status !== "done" && ticket.path.split("/")[0] !== ARCHIVE_DIR));
+	if (!matches.length) {
+		notifyPlanFilter(ctx, filters, tree);
+		return;
+	}
+	const counts = Object.entries(ticketCounts(tree))
+		.filter(([name]) => name !== ARCHIVE_DIR && !name.startsWith(`${ARCHIVE_DIR}/`))
+		.map(([name, count]) => `${name}: ${count} open`)
+		.join("\n") || "No open tickets.";
+	const trackLine = track
+		? ` Carry an indented \`Track: ${track.name}\` line and an \`Issue: <issue title>\` line under each step, and use the ticket body to shape the step.`
+		: " Use the ticket body to shape each step.";
+	const scope = `Work tickets from .pi/tracks/. Emit exactly one numbered implementation step per open issue (status todo or started); skip done issues.${trackLine}${guidance ? `\n\nGuidance: ${guidance}` : ""}\n\nMatching tickets:\n${ticketIndexLines(matches, 200)}\n\nPer-track open counts:\n${counts}`;
 	send(pi, planPrompt(scope));
 }
 
@@ -725,19 +769,20 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 			const rightWidth = Math.max(0, ...rows.map((row) => visibleWidth(right(row))));
 			// Live text gets the whole column left of the rail, not just the widest label.
 			const liveWidth = Math.max(0, width - rightWidth - 3);
-			const titleWidth = Math.min(Math.max(...rows.map((row, i) => visibleWidth(`${icons[i]} ${row.label}`))), liveWidth);
+			// Every row fills that column so labels and live text end at the same divider.
+			const titleWidth = liveWidth;
 			const done = rows.filter((row) => statusOf(row) === "done").length;
 			const lines = [theme.fg("text", `${done > 0 ? "●" : "○"} Plan ${done}/${rows.length}`) + theme.fg("muted", ` · ${goal}`)];
 			rows.forEach((row, i) => {
 				const status = statusOf(row);
 				const color = status === "running" ? "warning" : status === "done" ? "text" : status === "failed" || status === "cancelled" || status === "interrupted" ? "error" : "dim";
 				const branch = i === rows.length - 1 ? "└─" : "├─";
-				const label = `${icons[i]} ${truncateToWidth(row.label, titleWidth, "…", true)}`;
+				const label = padRightVisible(`${icons[i]} ${truncateToWidth(row.label, titleWidth, "…", true)}`, titleWidth);
 				lines.push(theme.fg(color, branch) + " " + theme.fg(color, label) + theme.fg(color, right(row)));
 				// Live status lives on its own branch line so rail columns never shift as text arrives.
 				if (status === "running" && row.task?.latest) {
 					const prefix = i === rows.length - 1 ? "   " : "│  ";
-					lines.push(...liveTaskLines(row.task.latest, prefix, liveWidth).map((line) => theme.fg("warning", line)));
+					lines.push(...liveTaskLines(row.task.latest, prefix, titleWidth).map((line) => theme.fg("warning", line)));
 				}
 			});
 			return lines.map((line) => truncateToWidth(line, width));
@@ -789,9 +834,9 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 					? visibleWidth(queuedRail(task))
 					: visibleWidth(statusRail(task, status === "running" ? runningCtxIcon : "/"));
 			}));
-			// `├─ ` prefix costs 3 columns; live text uses the rest of the label column up to the rail.
+			// `├─ ` prefix costs 3 columns; rows pad to that column so every rail divider aligns.
 			const liveWidth = Math.max(0, width - activeRightWidth - 3);
-			const titleWidth = Math.min(Math.max(...titles.map(visibleWidth)), liveWidth);
+			const titleWidth = liveWidth;
 			const done = d.tasks.filter((task, i) => (task.status ?? d.statuses?.[i] ?? "queued") === "done").length;
 			const lines: string[] = d.goal
 				? [theme.fg("text", `${done > 0 ? "●" : "○"} Plan ${done}/${d.tasks.length}`) + theme.fg("muted", ` · ${d.goal}`)]
@@ -799,7 +844,7 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 			d.tasks.forEach((task, i) => {
 				const status = task.status ?? d.statuses?.[i] ?? "queued";
 				const color = status === "running" ? "warning" : status === "done" ? "text" : status === "failed" || status === "cancelled" || status === "interrupted" ? "error" : "dim";
-				const left = truncateToWidth(titles[i]!, titleWidth, "…", true);
+				const left = padRightVisible(truncateToWidth(titles[i]!, titleWidth, "…", true), titleWidth);
 				const last = i === d.tasks.length - 1;
 				const prefix = theme.fg(color, last ? "└─ " : "├─ ");
 				if (status === "queued") {
@@ -808,7 +853,7 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 				}
 				lines.push(prefix + theme.fg(color, left) + theme.fg(color, statusRail(task, status === "running" ? runningCtxIcon : "/")));
 				// Live task output, on its own branch line so rail columns never shift.
-				if (status === "running" && task.latest) lines.push(...liveTaskLines(task.latest, last ? "   " : "│  ", liveWidth).map((line) => theme.fg("warning", line)));
+				if (status === "running" && task.latest) lines.push(...liveTaskLines(task.latest, last ? "   " : "│  ", titleWidth).map((line) => theme.fg("warning", line)));
 			});
 			if (d.note) lines.push(theme.fg("muted", d.note));
 			if (options.expanded) {
@@ -1026,12 +1071,74 @@ function resolvedToolPath(cwd: string, path: string): string {
 	return resolve(cwd, path.startsWith("@") ? path.slice(1) : path);
 }
 
-function trackList(node: TrackNode, lines: string[] = []): string[] {
+const TICKET_TYPES: TicketType[] = ["bug", "feature", "rnd"];
+const TICKET_STATUSES: TicketStatus[] = ["todo", "started", "done"];
+
+function openTypeCounts(node: TrackNode): string {
+	const counts: Record<TicketType, number> = { bug: 0, feature: 0, rnd: 0 };
+	for (const ticket of node.issues) if (ticket.status !== "done") counts[ticket.type]++;
+	const parts = TICKET_TYPES.filter((type) => counts[type]).map((type) => `${type} ${counts[type]}`);
+	return parts.join(", ") || "0 open";
+}
+
+function trackList(node: TrackNode, lines: string[] = [], top = true): string[] {
 	for (const child of node.children) {
-		lines.push(`${child.path}: ${child.issues.filter((issue) => issue.status !== "done").length} open / ${child.issues.length}`);
-		trackList(child, lines);
+		// Top-level `archive` is the done-ticket graveyard, not a track.
+		if (top && child.name === ARCHIVE_DIR) continue;
+		lines.push(`${child.path}: ${openTypeCounts(child)}`);
+		trackList(child, lines, false);
 	}
 	return lines;
+}
+
+function findTicket(tree: TrackNode, id: string): Ticket | undefined {
+	const needle = id.replace(/^#/, "").toLowerCase();
+	if (!needle) return undefined;
+	const tickets = filterTickets(tree, { idPrefix: needle });
+	return tickets.find((ticket) => ticket.id.toLowerCase() === needle) ?? (tickets.length === 1 ? tickets[0] : undefined);
+}
+
+function parseTicketFilters(input: string): { filters: TicketFilters; rest: string[] } {
+	const tokens = input.split(/\s+/).filter(Boolean);
+	const filters: TicketFilters = {};
+	const rest: string[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		const pair = token.match(/^(track|type|status):(.+)$/i);
+		if (pair) {
+			if (pair[1]!.toLowerCase() === "track") filters.track = pair[2]!;
+			else if (pair[1]!.toLowerCase() === "type") filters.type = pair[2]!.toLowerCase() as TicketType;
+			else filters.status = pair[2]!.toLowerCase() as TicketStatus;
+			continue;
+		}
+		const key = token.toLowerCase();
+		if ((key === "track" || key === "type" || key === "status") && tokens[i + 1]) {
+			const value = tokens[++i]!;
+			if (key === "track") filters.track = value;
+			else if (key === "type") filters.type = value.toLowerCase() as TicketType;
+			else filters.status = value.toLowerCase() as TicketStatus;
+			continue;
+		}
+		if (token.startsWith("#") && token.length > 1) {
+			filters.idPrefix = token.slice(1);
+			continue;
+		}
+		rest.push(token);
+	}
+	return { filters, rest };
+}
+
+// Optional `track <path>` / `--track <path>` prefix or suffix names the ticket track.
+function splitTicketTrack(input: string): { track?: string; text: string } {
+	const prefix = input.match(/^(?:--track|track)[:=]?\s+(\S+)\s+([\s\S]+)$/i);
+	if (prefix) return { track: prefix[1], text: prefix[2]!.trim() };
+	const suffix = input.match(/^([\s\S]+?)\s+(?:--track|track)[:=]?\s+(\S+)$/i);
+	if (suffix) return { track: suffix[2], text: suffix[1]!.trim() };
+	return { text: input.trim() };
+}
+
+function rewriteTicketTitle(text: string, title: string): string {
+	return /^#[ \t]+.*$/m.test(text) ? text.replace(/^#[ \t]+.*$/m, () => `# ${title}`) : `${text.trimEnd()}\n\n# ${title}\n`;
 }
 
 function tracksDir(cwd: string): string {
@@ -1067,13 +1174,13 @@ function findTrack(root: TrackNode, name: string): TrackNode | undefined {
 	return node;
 }
 
-const ISSUE_MARKER: Record<IssueStatus, string> = { todo: " ", doing: "-", done: "x" };
+const ISSUE_MARKER: Record<TicketStatus, string> = { todo: " ", started: "-", done: "x" };
 
-function issueLine(issue: TrackIssueFile): string {
+function issueLine(issue: Ticket): string {
 	return `- [${ISSUE_MARKER[issue.status]}] ${issue.title}${issue.body ? `\n${issue.body.replace(/^/gm, "  ")}` : ""}`;
 }
 
-function issueLines(issues: TrackIssueFile[], openOnly = false): string {
+function issueLines(issues: Ticket[], openOnly = false): string {
 	return issues.filter((issue) => !openOnly || issue.status !== "done").map(issueLine).join("\n");
 }
 
@@ -1083,7 +1190,7 @@ async function clearCompletedFiles(dir: string): Promise<number> {
 	for (const entry of readdirSync(dir, { withFileTypes: true })) {
 		const path = join(dir, entry.name);
 		if (entry.isDirectory()) cleared += await clearCompletedFiles(path);
-		else if (entry.isFile() && /\.md$/i.test(entry.name) && parseIssueFile(readFileSync(path, "utf8"), entry.name).status === "done") {
+		else if (entry.isFile() && /\.md$/i.test(entry.name) && parseTicketFile(readFileSync(path, "utf8"), entry.name).status === "done") {
 			await rm(path);
 			cleared++;
 		}
@@ -1101,9 +1208,10 @@ async function writeIssueStatus(cwd: string, task: LeanTask, status: "started" |
 			const track = findTrack(readTracksTree(rootDir), task.track!);
 			const issue = track?.issues.find((candidate) => candidate.title === task.issue);
 			if (!issue) return;
-			const next = status === "completed" ? "done" : "doing";
-			if (issue.status === next) return;
-			await writeFile(join(rootDir, ...issue.path.split("/")), serializeIssueFile({ title: issue.title, status: next, body: issue.body }), "utf8");
+			const next = status === "completed" ? "done" : "started";
+			const path = join(rootDir, ...issue.path.split("/"));
+			if (issue.status !== next) await writeFile(path, rewriteTicketStatus(readFileSync(path, "utf8"), next), "utf8");
+			if (status === "completed") await archiveTicket(rootDir, issue);
 		})
 		.catch(() => {});
 	await issueWrite;
@@ -1121,6 +1229,18 @@ async function unknownTrack(ctx: ExtensionContext, name: string): Promise<void> 
 	const rootDir = await ensureTracks(ctx.cwd);
 	const lines = trackList(readTracksTree(rootDir));
 	ctx.ui.notify(`Unknown track: ${name}\n${lines.join("\n") || `No tracks in ${rootDir}`}`, "warning");
+}
+
+// Unmatched plan filters show the cheap one-line index so a typo never dumps ticket bodies.
+function notifyPlanFilter(ctx: ExtensionContext, filters: TicketFilters, tree: TrackNode): void {
+	const label = [
+		filters.track && `track ${filters.track}`,
+		filters.type && `type:${filters.type}`,
+		filters.status && `status:${filters.status}`,
+		filters.idPrefix && `#${filters.idPrefix}`,
+	].filter(Boolean).join(" ");
+	const lines = ticketIndexLines(filterTickets(tree));
+	ctx.ui.notify(`No tickets match ${label}\n${lines || "No tickets in .pi/tracks/"}`, "warning");
 }
 
 export default function leanFlow(pi: ExtensionAPI) {
@@ -2148,6 +2268,98 @@ export default function leanFlow(pi: ExtensionAPI) {
 			ctx.ui.notify(`Track ${track.path}:\n${issueLines(track.issues) || "No issues."}`, "info");
 			const openText = issueLines(track.issues, true) || "No open issues; review the track and ask what to prototype.";
 			send(pi, `/skill:prototype Work the "${track.path}" track from .pi/tracks/. Open issues:\n${openText}`, true);
+		},
+	});
+
+	pi.registerCommand("ticket", {
+		description: "Tickets under .pi/tracks/: list [filters], show <id>, add <type> <title> [track <path>], rename <id> <title>, status <id> todo|started|done, restore <id>",
+		handler: async (args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const input = args.trim();
+			const parsed = input.match(/^(list|show|add|rename|status|restore)\b\s*([\s\S]*)$/i);
+			const verb = parsed?.[1]?.toLowerCase() ?? "list";
+			const rest = parsed?.[2]?.trim() ?? input;
+			const tree = readTracksTree(rootDir);
+			if (verb === "list") {
+				const { filters, rest: extras } = parseTicketFilters(rest);
+				if (extras.length) {
+					ctx.ui.notify(`Unknown ticket filter: ${extras.join(" ")}\nUse track <path>, type:<bug|feature|rnd>, status:<todo|started|done>, or #<id>`, "warning");
+					return;
+				}
+				const lines = ticketIndexLines(filterTickets(tree, filters));
+				ctx.ui.notify(lines ? `Tickets:\n${lines}` : "No matching tickets", lines ? "info" : "warning");
+				return;
+			}
+			if (verb === "add") {
+				const add = rest.match(/^(\S+)\s+([\s\S]+)$/);
+				const type = add?.[1]?.toLowerCase() as TicketType | undefined;
+				const named = add ? splitTicketTrack(add[2]!) : undefined;
+				if (!type || !TICKET_TYPES.includes(type) || !named?.text) {
+					ctx.ui.notify("Usage: /ticket add <bug|feature|rnd> <title> [track <path>]", "warning");
+					return;
+				}
+				const trackName = named.track ?? planTrack(readPlan(ctx.cwd) ?? "");
+				const track = trackName ? findTrack(tree, trackName) : undefined;
+				if (trackName && !track) {
+					await unknownTrack(ctx, trackName);
+					return;
+				}
+				const dir = track ? join(rootDir, ...track.path.split("/")) : rootDir;
+				const ticket = { type, id: mintTicketId(tree), status: "todo" as const, title: named.text, body: "" };
+				const path = join(dir, ticketFileName(ticket));
+				await mkdir(dir, { recursive: true });
+				await writeFile(path, serializeTicketFile(ticket), "utf8");
+				ctx.ui.notify(`Added ${type} ${ticket.id} in ${track?.path ?? "(root)"}: ${ticket.title}`, "info");
+				return;
+			}
+			if (verb === "show") {
+				const ticket = findTicket(tree, rest);
+				if (!ticket) {
+					ctx.ui.notify(`Unknown ticket: ${rest || "<id>"}`, "warning");
+					return;
+				}
+				ctx.ui.notify(`${ticket.type} ${ticket.id} ${ticket.status} ${ticket.track || "(root)"}\n${ticket.title}${ticket.body ? `\n\n${ticket.body}` : ""}\n${ticket.path}`, "info");
+				return;
+			}
+			if (verb === "rename") {
+				const renameArgs = rest.match(/^#?(\S+)\s+([\s\S]+)$/);
+				const ticket = renameArgs ? findTicket(tree, renameArgs[1]!) : undefined;
+				const title = renameArgs?.[2]?.trim();
+				if (!ticket || !title) {
+					ctx.ui.notify("Usage: /ticket rename <id> <title>", "warning");
+					return;
+				}
+				const source = join(rootDir, ...ticket.path.split("/"));
+				const target = join(dirname(source), ticketFileName({ type: ticket.type, id: ticket.id, title }));
+				if (target !== source && existsSync(target)) {
+					ctx.ui.notify(`Ticket file already exists: ${target.slice(rootDir.length + 1)}`, "warning");
+					return;
+				}
+				await writeFile(source, rewriteTicketTitle(readFileSync(source, "utf8"), title), "utf8");
+				if (target !== source) await rename(source, target);
+				ctx.ui.notify(`Renamed ${ticket.id}: ${ticket.title} -> ${title}`, "info");
+				return;
+			}
+			if (verb === "status") {
+				const statusArgs = rest.match(/^#?(\S+)\s+(todo|started|done)$/i);
+				const ticket = statusArgs ? findTicket(tree, statusArgs[1]!) : undefined;
+				const status = statusArgs?.[2]?.toLowerCase() as TicketStatus | undefined;
+				if (!ticket || !status) {
+					ctx.ui.notify("Usage: /ticket status <id> todo|started|done", "warning");
+					return;
+				}
+				const path = join(rootDir, ...ticket.path.split("/"));
+				await writeFile(path, rewriteTicketStatus(readFileSync(path, "utf8"), status), "utf8");
+				ctx.ui.notify(`Ticket ${ticket.id} -> ${status}`, "info");
+				return;
+			}
+			const archived = rest && filterTickets(tree, { idPrefix: rest.replace(/^#/, "") }).find((ticket) => ticket.path.split("/")[0] === ARCHIVE_DIR);
+			if (!archived) {
+				ctx.ui.notify(`No archived ticket: ${rest || "<id>"}`, "warning");
+				return;
+			}
+			const target = await restoreTicket(rootDir, archived);
+			ctx.ui.notify(`Restored ${archived.id} -> ${target.slice(rootDir.length + 1)}`, "info");
 		},
 	});
 
