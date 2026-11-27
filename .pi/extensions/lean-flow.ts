@@ -1115,7 +1115,7 @@ function openTypeCounts(node: TrackNode): string {
 
 function trackList(node: TrackNode, lines: string[] = [], top = true): string[] {
 	for (const child of node.children) {
-		// Top-level `archive` is the done-ticket graveyard, not a track.
+		// Top-level `archive` is reserved legacy, not a track; nothing writes it.
 		if (top && child.name === ARCHIVE_DIR) continue;
 		lines.push(`${child.path}: ${openTypeCounts(child)}`);
 		trackList(child, lines, false);

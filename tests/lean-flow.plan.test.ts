@@ -457,6 +457,14 @@ test("completedTracks selects all-done and empty tracks, skipping a parent with 
 		}],
 	};
 	assert.deepEqual(completedTracks(startedChild).map((track) => track.path), []);
+
+	const archived = {
+		name: "",
+		path: "",
+		issues: [],
+		children: [{ name: "archive", path: "archive", issues: [done("archive/2026-01/feature-eee555-e.md")], children: [] }],
+	};
+	assert.deepEqual(completedTracks(archived).map((track) => track.path), []);
 });
 
 test("doneTickets selects plain and nested done tickets and none when every ticket is open", () => {
@@ -570,8 +578,8 @@ test("migrateTracksMd skips the ledger once the .migrated marker exists", async 
 	}
 });
 
-test("migrateTracksMd merges only missing ledger issues into a populated tree", async () => {
-	const root = mkdtempSync(join(tmpdir(), "lean-merge-"));
+test("migrateTracksMd skips the ledger for a populated tree without the marker", async () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-populated-"));
 	try {
 		const tracksMd = join(root, "tracks.md");
 		const tracksDir = join(root, ".pi", "tracks");
@@ -579,14 +587,13 @@ test("migrateTracksMd merges only missing ledger issues into a populated tree", 
 		writeFileSync(join(tracksDir, "widget-api", "feature-aaaaaa-keep-me.md"), "---\nstatus: started\ntype: feature\n---\n\n# Keep me\n\nOld body.\n");
 
 		writeFileSync(tracksMd, `## widget-api\n\n- [ ] Keep me\n- [ ] Add me\n  New detail.\n`);
-		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 1, "only the missing issue is added");
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 0, "a populated tree without the marker is treated as migrated");
+		assert.ok(existsSync(join(tracksDir, ".migrated")), "the skipped import still writes the marker");
 		const tickets = filterTickets(readTracksTree(tracksDir), { track: "widget-api" });
-		assert.deepEqual(tickets.map((ticket) => ticket.title).sort(), ["Add me", "Keep me"]);
-		const kept = tickets.find((ticket) => ticket.title === "Keep me")!;
+		assert.deepEqual(tickets.map((ticket) => ticket.title), ["Keep me"], "missing ledger issues are not re-added");
+		const kept = tickets[0]!;
 		assert.deepEqual([kept.id, kept.path, kept.status, kept.body], ["aaaaaa", "widget-api/feature-aaaaaa-keep-me.md", "started", "Old body."]);
-		assert.deepEqual(tickets.find((ticket) => ticket.title === "Add me")!.body, "New detail.");
 		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 0, "second run is a no-op");
-		assert.deepEqual(filterTickets(readTracksTree(tracksDir), { track: "widget-api" }), tickets, "existing ids and bodies are unchanged");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

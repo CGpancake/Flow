@@ -1,8 +1,8 @@
 // Pure lean-flow helpers: plan/run parsing plus tracks-tree and ticket file IO. Entry points are
 // plan/run (tasksFromPlanText, branchSlug, reviewVerdict) and tracks/tickets (parseTracks,
-// parseTicketFile, readTracksTree, parseTicketFilters, filterTickets, import tickets). No Pi imports so
-// tests/*.test.ts run under plain `node --test`. Split trigger: move ticket read/write/migrate
-// into lean-flow-tickets.ts once ticket IO outgrows parsing.
+// parseTicketFile, readTracksTree, parseTicketFilters, filterTickets, completedTracks, doneTickets,
+// import tickets). No Pi imports so tests/*.test.ts run under plain `node --test`. Split trigger: move
+// ticket read/write/migrate into lean-flow-tickets.ts once ticket IO outgrows parsing.
 
 import { randomBytes } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
@@ -439,11 +439,16 @@ function trackCompleted(node: TrackNode): boolean {
 	return node.issues.every((ticket) => ticket.status === "done") && node.children.every(trackCompleted);
 }
 
-// Every completed track node, parents before their nested tracks (root excluded). `/track-clear` acts on these.
+// Top-level `archive` is reserved legacy (done tickets once mirrored their track under
+// archive/<YYYY-MM>/); nothing writes it.
+export const ARCHIVE_DIR = "archive";
+
+// Every completed track node, parents before their nested tracks (root and reserved archive excluded). `/track-clear` acts on these.
 export function completedTracks(tree: TrackNode): TrackNode[] {
 	const tracks: TrackNode[] = [];
 	const visit = (node: TrackNode) => {
 		for (const child of node.children) {
+			if (child.path.split("/")[0] === ARCHIVE_DIR) continue;
 			if (trackCompleted(child)) tracks.push(child);
 			visit(child);
 		}
@@ -461,8 +466,6 @@ export function doneTickets(tree: TrackNode): Ticket[] {
 	return tickets;
 }
 
-// Top-level `archive` is reserved: done tickets mirror their track under archive/<YYYY-MM>/.
-export const ARCHIVE_DIR = "archive";
 export const INBOX_DIR = "inbox";
 
 // Rename legacy `<slug>.md` tickets in place, minting a 6-hex id and keeping the track folder.
@@ -502,11 +505,11 @@ async function moveRootTickets(root: string, used: Set<string>): Promise<boolean
 	return changed;
 }
 
-// Additive `tracks.md` merge: existing tickets are keyed by track path plus title, so only
-// missing ledger issues are written with minted typed filenames. Returns how many were added,
-// so a repeat run returns 0. A `.migrated` marker inside tracksDir skips later ledger imports,
-// so tickets deleted after the first import stay deleted. Also renames legacy `<slug>.md`
-// tickets and moves root tickets to inbox/. Never deletes `tracks.md` (humans compare first).
+// One-shot `tracks.md` import: the first run writes minted typed filenames and a `.migrated`
+// marker inside tracksDir. Later runs skip the ledger, so tickets deleted after the first import
+// stay deleted. A populated tree without the marker predates one-shot import, so it is marked
+// migrated instead of risking re-adding deleted tickets. Also renames legacy `<slug>.md` tickets
+// and moves root tickets to inbox/. Never deletes `tracks.md` (humans compare first).
 export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<number> {
 	const tree = readTracksTree(tracksDir);
 	const used = ticketIds(tree);
@@ -515,9 +518,14 @@ export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): 
 	const marker = join(tracksDir, MIGRATED_MARKER);
 	if (existsSync(marker)) return 0;
 	if (!existsSync(tracksMdPath)) return 0;
-	const tracks = parseTracks(readFileSync(tracksMdPath, "utf8"));
 	const existing = new Set<string>();
 	walkTickets(readTracksTree(tracksDir), (ticket) => existing.add(`${ticket.track}\0${ticket.title}`));
+	if (existing.size) {
+		await mkdir(tracksDir, { recursive: true });
+		await writeFile(marker, "", "utf8");
+		return 0;
+	}
+	const tracks = parseTracks(readFileSync(tracksMdPath, "utf8"));
 	let added = 0;
 	for (const track of tracks) {
 		const segments = track.name.split("/").map((segment) => segment.trim()).filter((segment) => segment && segment !== "." && segment !== "..");
