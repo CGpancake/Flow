@@ -621,9 +621,9 @@ async function startPlan(pi: ExtensionAPI, ctx: ExtensionContext, input: string)
 		.map(([name, count]) => `${name}: ${count} open`)
 		.join("\n") || "No open tickets.";
 	const trackLine = track
-		? ` Carry an indented \`Track: ${track.name}\` line and an \`Issue: <issue title>\` line under each step, and use the ticket body to shape the step.`
+		? ` Carry an indented \`Track: ${track.name}\` line and a \`Ticket: <ticket title>\` line under each step, and use the ticket body to shape the step.`
 		: " Use the ticket body to shape each step.";
-	const scope = `Work tickets from .pi/tracks/. Emit exactly one numbered implementation step per open issue (status todo or started); skip done issues.${trackLine}${guidance ? `\n\nGuidance: ${guidance}` : ""}\n\nMatching tickets:\n${ticketIndexLines(matches, 200)}\n\nPer-track open counts:\n${counts}`;
+	const scope = `Work tickets from .pi/tracks/. Emit exactly one numbered implementation step per open ticket (status todo or started); skip done tickets.${trackLine}${guidance ? `\n\nGuidance: ${guidance}` : ""}\n\nMatching tickets:\n${ticketIndexLines(matches, 200)}\n\nPer-track open counts:\n${counts}`;
 	send(pi, planPrompt(scope));
 }
 
@@ -2212,7 +2212,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("track", {
-		description: "List .pi/tracks/ tracks (the /tracks alias was removed); /track add <area/sub>, /track rename <old> <new>, /track clear, /track <area/sub> shows issues and injects the prototype skill",
+		description: "List .pi/tracks/ tracks (the /tracks alias was removed); /track add <area/sub>, /track rename <old> <new>, /track clear, /track <area/sub> shows tickets and injects the prototype skill",
 		handler: async (args, ctx) => {
 			const rootDir = await ensureTracks(ctx.cwd);
 			const input = args.trim();
@@ -2272,7 +2272,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 					return;
 				}
 				const archived = await archiveCompletedFiles(rootDir);
-				ctx.ui.notify(archived ? `Archived ${archived} done issue${archived === 1 ? "" : "s"} in ${rootDir}` : "No done issues to archive", "info");
+				ctx.ui.notify(archived ? `Archived ${archived} done ticket${archived === 1 ? "" : "s"} in ${rootDir}` : "No done tickets to archive", "info");
 				return;
 			}
 			if (!input) {
@@ -2285,9 +2285,9 @@ export default function leanFlow(pi: ExtensionAPI) {
 				await unknownTrack(ctx, input);
 				return;
 			}
-			ctx.ui.notify(`Track ${track.path}:\n${issueLines(track.issues) || "No issues."}`, "info");
-			const openText = issueLines(track.issues, true) || "No open issues; review the track and ask what to prototype.";
-			send(pi, `/skill:prototype Work the "${track.path}" track from .pi/tracks/. Open issues:\n${openText}`, true);
+			ctx.ui.notify(`Track ${track.path}:\n${issueLines(track.issues) || "No tickets."}`, "info");
+			const openText = issueLines(track.issues, true) || "No open tickets; review the track and ask what to prototype.";
+			send(pi, `/skill:prototype Work the "${track.path}" track from .pi/tracks/. Open tickets:\n${openText}`, true);
 		},
 	});
 
