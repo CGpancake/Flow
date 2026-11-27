@@ -2023,7 +2023,9 @@ export default function leanFlow(pi: ExtensionAPI) {
 				const status = paused ? "paused" : controller.signal.aborted ? "cancelled" : failed ? "failed" : "complete";
 				if (status === "complete") renderPlanOverlay(ctx);
 				const reason = status === "failed" && result.isError ? result.content?.[0]?.text : undefined;
-				const index = progress.some((task) => task.status !== "queued") ? result.content?.[0]?.text : undefined;
+				// Completed chains print only the one-line summary; the widget and run files index the tasks.
+				// Failures and cancels keep the full list so the human can triage without opening the run dir.
+				const index = status === "failed" || status === "cancelled" ? result.content?.[0]?.text : undefined;
 				const nextStep = paused ? progress.find((task) => task.status === "queued")?.task.match(/\bplan step (\d+)\s*:/i)?.[1] : undefined;
 				const line = paused
 					? nextStep
