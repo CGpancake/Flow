@@ -785,7 +785,7 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 				// Live status lives on its own branch line so rail columns never shift as text arrives.
 				if (status === "running" && row.task?.latest) {
 					const prefix = i === rows.length - 1 ? "   " : "│  ";
-					lines.push(theme.fg("warning", liveTaskLine(row.task.latest, prefix, titleWidth, visibleWidth(rail), AGENT_TAG[row.task.agent] ?? "")));
+					lines.push(theme.fg("warning", liveTaskLine(row.task.latest, prefix, titleWidth, rail)));
 				}
 			});
 			return lines.map((line) => truncateToWidth(line, width));
@@ -796,9 +796,10 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 // Live task text runs across the label column and the row's own status rail, stopping at the
 // divider before the role glyph so its trailing ` │` lines up with that row's last divider.
 // Returns one line only: the widgets add a single live row per running task.
-function liveTaskLine(latest: string, prefix: string, labelWidth: number, railWidth: number, glyph: string): string {
-	// Drop the rail's trailing space+glyph, then pad to the row's divider: "↳ " costs 2 columns.
-	const fillWidth = labelWidth + railWidth - 3 - visibleWidth(glyph);
+function liveTaskLine(latest: string, prefix: string, labelWidth: number, rail: string): string {
+	// Fill up to the rail's last divider, dropping its trailing ` │ <glyph>` whatever the glyph is.
+	const divider = rail.lastIndexOf("│");
+	const fillWidth = labelWidth + visibleWidth((divider >= 0 ? rail.slice(0, divider) : rail).trimEnd());
 	const room = Math.max(8, fillWidth - 2);
 	const clean = latest.replace(/\s+/g, " ").trim();
 	let text = clean;
@@ -883,7 +884,7 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 				}
 				lines.push(prefix + theme.fg(color, left) + theme.fg(color, rail));
 				// Live task output, on its own branch line so rail columns never shift.
-				if (status === "running" && task.latest) lines.push(theme.fg("warning", liveTaskLine(task.latest, last ? "   " : "│  ", titleWidth, visibleWidth(rail), AGENT_TAG[task.agent] ?? "")));
+				if (status === "running" && task.latest) lines.push(theme.fg("warning", liveTaskLine(task.latest, last ? "   " : "│  ", titleWidth, rail)));
 			});
 			if (d.note) lines.push(theme.fg("muted", d.note));
 			if (options.expanded) {
