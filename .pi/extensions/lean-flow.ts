@@ -12,9 +12,10 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
 	appendPlanStep,
-	archiveTicket,
 	ARCHIVE_DIR,
 	branchSlug,
+	completedTracks,
+	doneTickets,
 	filterTickets,
 	INBOX_DIR,
 	migrateTracksMd,
@@ -27,7 +28,6 @@ import {
 	parseTicketFilters,
 	pathRefs,
 	readTracksTree,
-	restoreTicket,
 	reviewVerdict,
 	rewriteTicketStatus,
 	runId as makeRunId,
@@ -62,7 +62,7 @@ Permanent rules for the parent agent:
 - Output caveman-terse: code/actions first, then at most three short lines.
 - Use batched grill only when ambiguity changes implementation. Generate the whole question batch at once, then evaluate answers as a batch.
 - If context usage reaches about 50%, prepare a /handover and stop instead of compacting by default.
-- Tracks live as folders of typed ticket files under .pi/tracks/: filename <type>-<id>-<slug>.md, frontmatter status todo|started|done. Create tickets with /ticket add <type> <title> [track <path>], never by hand-writing .md files; set a ticket's status to started/done in its frontmatter; never rewrite unrelated tracks.`;
+- Tracks live as folders of typed ticket files under .pi/tracks/: filename <type>-<id>-<slug>.md, frontmatter status todo|started|done. Create tickets with /ticket-add <type> <title> [track <path>], never by hand-writing .md files; set a ticket's status to started/done in its frontmatter; never rewrite unrelated tracks.`;
 
 const LEAN_SYSTEM_WORKFLOW = `
 - No long-term memory, lifecycle docs, ADRs, or issue tracker ceremony unless the user explicitly asks.
@@ -193,7 +193,7 @@ Rules:
 - Keep modules feature/function focused and readable; split only by reason-to-change.
 - For non-trivial modules you touch, keep/add a tiny top header: purpose, main entry points, split trigger. Use rg over headers first; avoid broad reads unless slices prove insufficient.
 - Do not create memory/docs/ADRs/plans. Code and tests are the source of truth.
-- If a matching ticket under .pi/tracks/ is yours, set its frontmatter status to started/done; create tickets with /ticket add, never hand-written .md files; never rewrite unrelated tracks.
+- If a matching ticket under .pi/tracks/ is yours, set its frontmatter status to started/done; create tickets with /ticket-add, never hand-written .md files; never rewrite unrelated tracks.
 - Run the smallest relevant check. If no automated check exists, say so.
 - Output caveman-terse: changed files; checks; blockers; manual validation. No essays.
 
@@ -1184,12 +1184,6 @@ function issueLines(issues: Ticket[], openOnly = false): string {
 	return issues.filter((issue) => !openOnly || issue.status !== "done").map(issueLine).join("\n");
 }
 
-async function archiveCompletedFiles(rootDir: string): Promise<number> {
-	const done = filterTickets(readTracksTree(rootDir), { status: "done" }).filter((ticket) => ticket.path.split("/")[0] !== ARCHIVE_DIR);
-	for (const ticket of done) await archiveTicket(rootDir, ticket);
-	return done.length;
-}
-
 let issueWrite = Promise.resolve();
 // Serialized because parallel workers share the tree read-modify-write.
 async function writeIssueStatus(cwd: string, task: LeanTask, status: "started" | "completed"): Promise<void> {
@@ -1203,7 +1197,6 @@ async function writeIssueStatus(cwd: string, task: LeanTask, status: "started" |
 			const next = status === "completed" ? "done" : "started";
 			const path = join(rootDir, ...issue.path.split("/"));
 			if (issue.status !== next) await writeFile(path, rewriteTicketStatus(readFileSync(path, "utf8"), next), "utf8");
-			if (status === "completed") await archiveTicket(rootDir, issue);
 		})
 		.catch(() => {});
 	await issueWrite;
@@ -2187,72 +2180,19 @@ export default function leanFlow(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("track", {
-		description: "List .pi/tracks/ tracks (the /tracks alias was removed); /track add <area/sub>, /track rename <old> <new>, /track clear, /track <area/sub> shows tickets and injects the prototype skill",
+		description: "List .pi/tracks/ tracks; /track <area/sub> shows tickets and injects the prototype skill (use /track-add, /track-rename, /track-clear for edits)",
 		handler: async (args, ctx) => {
 			const rootDir = await ensureTracks(ctx.cwd);
 			const input = args.trim();
-			if (/^add\b/i.test(input)) {
-				const name = input.match(/^add\s+(.+)$/i)?.[1]?.trim();
-				const segments = name ? trackSegments(name) : undefined;
-				if (!segments) {
-					ctx.ui.notify("Usage: /track add <area/sub>", "warning");
-					return;
-				}
-				const path = join(rootDir, ...segments);
-				if (existsSync(path) || findTrack(readTracksTree(rootDir), segments.join("/"))) {
-					ctx.ui.notify(`Track already exists: ${segments.join("/")}`, "warning");
-					return;
-				}
-				await mkdir(path, { recursive: true });
-				ctx.ui.notify(`Added track: ${segments.join("/")}`, "info");
-				return;
-			}
-			if (/^rename\b/i.test(input)) {
-				const match = input.match(/^rename\s+(.+?)\s+(?:->|to)\s+(.+)$/i) ?? input.match(/^rename\s+(\S+)\s+(\S+)$/i);
-				if (!match) {
-					ctx.ui.notify("Usage: /track rename <old> <new> (or <old> to <new>)", "warning");
-					return;
-				}
-				const track = findTrack(readTracksTree(rootDir), match[1]!);
-				if (!track) {
-					await unknownTrack(ctx, match[1]!);
-					return;
-				}
-				const segments = trackSegments(match[2]!);
-				if (!segments) {
-					ctx.ui.notify("Usage: /track rename <old> <new> (or <old> to <new>)", "warning");
-					return;
-				}
-				const targetPath = segments.join("/");
-				const lower = targetPath.toLowerCase();
-				if (lower === track.path.toLowerCase()) return;
-				if (lower.startsWith(`${track.path.toLowerCase()}/`)) {
-					ctx.ui.notify(`Cannot move ${track.path} inside itself`, "warning");
-					return;
-				}
-				const target = join(rootDir, ...segments);
-				if (existsSync(target) || findTrack(readTracksTree(rootDir), targetPath)) {
-					ctx.ui.notify(`Track already exists: ${targetPath}`, "warning");
-					return;
-				}
-				await mkdir(dirname(target), { recursive: true });
-				await rename(join(rootDir, ...track.path.split("/")), target);
-				ctx.ui.notify(`Renamed track: ${track.path} -> ${targetPath}`, "info");
-				return;
-			}
-			if (/^clear$/i.test(input)) {
-				const tree = readTracksTree(rootDir);
-				if (!tree.children.length && !tree.issues.length) {
-					ctx.ui.notify(`No tracks in ${rootDir}`, "warning");
-					return;
-				}
-				const archived = await archiveCompletedFiles(rootDir);
-				ctx.ui.notify(archived ? `Archived ${archived} done ticket${archived === 1 ? "" : "s"} in ${rootDir}` : "No done tickets to archive", "info");
+			const legacy = input.match(/^(add|rename|clear)\b\s*([\s\S]*)$/i);
+			if (legacy) {
+				const rest = legacy[2]?.trim();
+				ctx.ui.notify(`Use /track-${legacy[1]!.toLowerCase()}${rest ? ` ${rest}` : ""}`, "info");
 				return;
 			}
 			if (!input) {
 				const lines = trackList(readTracksTree(rootDir));
-				ctx.ui.notify(lines.length ? `Tracks:\n${lines.join("\n")}` : `No tracks in ${rootDir}; use /track add <area/sub>`, lines.length ? "info" : "warning");
+				ctx.ui.notify(lines.length ? `Tracks:\n${lines.join("\n")}` : `No tracks in ${rootDir}; use /track-add <area/sub>`, lines.length ? "info" : "warning");
 				return;
 			}
 			const track = findTrack(readTracksTree(rootDir), input);
@@ -2266,100 +2206,196 @@ export default function leanFlow(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("ticket", {
-		description: "Tickets under .pi/tracks/: list [filters], show <id>, add <type> <title> [track <path>], rename <id> <title>, status <id> todo|started|done, restore <id>",
+	pi.registerCommand("track-add", {
+		description: "Create a track folder under .pi/tracks/",
+		handler: async (args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const segments = trackSegments(args.trim());
+			if (!segments) {
+				ctx.ui.notify("Usage: /track-add <area/sub>", "warning");
+				return;
+			}
+			const path = join(rootDir, ...segments);
+			if (existsSync(path) || findTrack(readTracksTree(rootDir), segments.join("/"))) {
+				ctx.ui.notify(`Track already exists: ${segments.join("/")}`, "warning");
+				return;
+			}
+			await mkdir(path, { recursive: true });
+			ctx.ui.notify(`Added track: ${segments.join("/")}`, "info");
+		},
+	});
+
+	pi.registerCommand("track-rename", {
+		description: "Rename or move a track folder under .pi/tracks/",
 		handler: async (args, ctx) => {
 			const rootDir = await ensureTracks(ctx.cwd);
 			const input = args.trim();
-			const parsed = input.match(/^(list|show|add|rename|status|restore)\b\s*([\s\S]*)$/i);
-			const verb = parsed?.[1]?.toLowerCase() ?? "list";
-			const rest = parsed?.[2]?.trim() ?? input;
+			const match = input.match(/^(.+?)\s+(?:->|to)\s+(.+)$/i) ?? input.match(/^(\S+)\s+(\S+)$/);
+			if (!match) {
+				ctx.ui.notify("Usage: /track-rename <old> <new> (or <old> to <new>)", "warning");
+				return;
+			}
+			const track = findTrack(readTracksTree(rootDir), match[1]!);
+			if (!track) {
+				await unknownTrack(ctx, match[1]!);
+				return;
+			}
+			const segments = trackSegments(match[2]!);
+			if (!segments) {
+				ctx.ui.notify("Usage: /track-rename <old> <new> (or <old> to <new>)", "warning");
+				return;
+			}
+			const targetPath = segments.join("/");
+			const lower = targetPath.toLowerCase();
+			if (lower === track.path.toLowerCase()) return;
+			if (lower.startsWith(`${track.path.toLowerCase()}/`)) {
+				ctx.ui.notify(`Cannot move ${track.path} inside itself`, "warning");
+				return;
+			}
+			const target = join(rootDir, ...segments);
+			if (existsSync(target) || findTrack(readTracksTree(rootDir), targetPath)) {
+				ctx.ui.notify(`Track already exists: ${targetPath}`, "warning");
+				return;
+			}
+			await mkdir(dirname(target), { recursive: true });
+			await rename(join(rootDir, ...track.path.split("/")), target);
+			ctx.ui.notify(`Renamed track: ${track.path} -> ${targetPath}`, "info");
+		},
+	});
+
+	pi.registerCommand("track-clear", {
+		description: "Delete completed track folders (all tickets done) recursively",
+		handler: async (_args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const completed = completedTracks(readTracksTree(rootDir));
+			if (!completed.length) {
+				ctx.ui.notify("No completed tracks to clear", "warning");
+				return;
+			}
+			for (const track of completed) await rm(join(rootDir, ...track.path.split("/")), { recursive: true, force: true });
+			ctx.ui.notify(`Cleared ${completed.length} completed track${completed.length === 1 ? "" : "s"}:\n${completed.map((track) => track.path).join("\n")}`, "info");
+		},
+	});
+
+	pi.registerCommand("ticket", {
+		description: "Legacy ticket subactions; use /ticket-list, /ticket-show, /ticket-add, /ticket-rename, /ticket-status, or /ticket-clear",
+		handler: async (args, ctx) => {
+			const input = args.trim();
+			const match = input.match(/^(list|show|add|rename|status|restore)\b\s*([\s\S]*)$/i);
+			const verb = match?.[1]?.toLowerCase() ?? "list";
+			const rest = (match?.[2] ?? input).trim();
+			const command = verb === "restore" ? "ticket-status" : `ticket-${verb}`;
+			const suffix = verb === "restore" ? `${rest ? ` ${rest}` : " <id>"} todo` : rest ? ` ${rest}` : "";
+			ctx.ui.notify(`Use /${command}${suffix}`, "info");
+		},
+	});
+
+	pi.registerCommand("ticket-list", {
+		description: "List tickets under .pi/tracks/ with optional track/type/status/#id filters",
+		handler: async (args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const { filters, rest: extras } = parseTicketFilters(args.trim());
+			if (extras.length) {
+				ctx.ui.notify(`Unknown ticket filter: ${extras.join(" ")}\nUse track <path>, type:<bug|feature|rnd>, status:<todo|started|done>, or #<id>`, "warning");
+				return;
+			}
+			const lines = ticketIndexLines(filterTickets(readTracksTree(rootDir), filters));
+			ctx.ui.notify(lines ? `Tickets:\n${lines}` : "No matching tickets", lines ? "info" : "warning");
+		},
+	});
+
+	pi.registerCommand("ticket-show", {
+		description: "Show one ticket under .pi/tracks/ by id",
+		handler: async (args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const id = args.trim();
+			const ticket = findTicket(readTracksTree(rootDir), id);
+			if (!ticket) {
+				ctx.ui.notify(`Unknown ticket: ${id || "<id>"}`, "warning");
+				return;
+			}
+			ctx.ui.notify(`${ticket.type} ${ticket.id} ${ticket.status} ${ticket.track || "(root)"}\n${ticket.title}${ticket.body ? `\n\n${ticket.body}` : ""}\n${ticket.path}`, "info");
+		},
+	});
+
+	pi.registerCommand("ticket-add", {
+		description: "Add a ticket under .pi/tracks/: /ticket-add <bug|feature|rnd> <title> [track <path>]",
+		handler: async (args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const add = args.trim().match(/^(\S+)\s+([\s\S]+)$/);
+			const type = add?.[1]?.toLowerCase() as TicketType | undefined;
+			const named = add ? splitTicketTrack(add[2]!) : undefined;
+			if (!type || !TICKET_TYPES.includes(type) || !named?.text) {
+				ctx.ui.notify("Usage: /ticket-add <bug|feature|rnd> <title> [track <path>]", "warning");
+				return;
+			}
 			const tree = readTracksTree(rootDir);
-			if (verb === "list") {
-				const { filters, rest: extras } = parseTicketFilters(rest);
-				if (extras.length) {
-					ctx.ui.notify(`Unknown ticket filter: ${extras.join(" ")}\nUse track <path>, type:<bug|feature|rnd>, status:<todo|started|done>, or #<id>`, "warning");
-					return;
-				}
-				const lines = ticketIndexLines(filterTickets(tree, filters));
-				ctx.ui.notify(lines ? `Tickets:\n${lines}` : "No matching tickets", lines ? "info" : "warning");
+			const requested = named.track ?? planTrack(readPlan(ctx.cwd) ?? "");
+			const track = requested ? findTrack(tree, requested) : undefined;
+			if (!track && named.track && requested?.toLowerCase() !== INBOX_DIR) {
+				await unknownTrack(ctx, named.track);
 				return;
 			}
-			if (verb === "add") {
-				const add = rest.match(/^(\S+)\s+([\s\S]+)$/);
-				const type = add?.[1]?.toLowerCase() as TicketType | undefined;
-				const named = add ? splitTicketTrack(add[2]!) : undefined;
-				if (!type || !TICKET_TYPES.includes(type) || !named?.text) {
-					ctx.ui.notify("Usage: /ticket add <bug|feature|rnd> <title> [track <path>]", "warning");
-					return;
-				}
-				const requested = named.track ?? planTrack(readPlan(ctx.cwd) ?? "");
-				const track = requested ? findTrack(tree, requested) : undefined;
-				if (!track && named.track && requested?.toLowerCase() !== INBOX_DIR) {
-					await unknownTrack(ctx, named.track);
-					return;
-				}
-				const dir = track ? join(rootDir, ...track.path.split("/")) : join(rootDir, INBOX_DIR);
-				const ticket = { type, id: mintTicketId(tree), status: "todo" as const, title: named.text, body: "" };
-				const path = join(dir, ticketFileName(ticket));
-				await mkdir(dir, { recursive: true });
-				await writeFile(path, serializeTicketFile(ticket), "utf8");
-				ctx.ui.notify(`Added ${type} ${ticket.id} in ${track?.path ?? INBOX_DIR}: ${ticket.title}`, "info");
+			const dir = track ? join(rootDir, ...track.path.split("/")) : join(rootDir, INBOX_DIR);
+			const ticket = { type, id: mintTicketId(tree), status: "todo" as const, title: named.text, body: "" };
+			const path = join(dir, ticketFileName(ticket));
+			await mkdir(dir, { recursive: true });
+			await writeFile(path, serializeTicketFile(ticket), "utf8");
+			ctx.ui.notify(`Added ${type} ${ticket.id} in ${track?.path ?? INBOX_DIR}: ${ticket.title}`, "info");
+		},
+	});
+
+	pi.registerCommand("ticket-rename", {
+		description: "Rename a ticket under .pi/tracks/: /ticket-rename <id> <title>",
+		handler: async (args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const renameArgs = args.trim().match(/^#?(\S+)\s+([\s\S]+)$/);
+			const ticket = renameArgs ? findTicket(readTracksTree(rootDir), renameArgs[1]!) : undefined;
+			const title = renameArgs?.[2]?.trim();
+			if (!ticket || !title) {
+				ctx.ui.notify("Usage: /ticket-rename <id> <title>", "warning");
 				return;
 			}
-			if (verb === "show") {
-				const ticket = findTicket(tree, rest);
-				if (!ticket) {
-					ctx.ui.notify(`Unknown ticket: ${rest || "<id>"}`, "warning");
-					return;
-				}
-				ctx.ui.notify(`${ticket.type} ${ticket.id} ${ticket.status} ${ticket.track || "(root)"}\n${ticket.title}${ticket.body ? `\n\n${ticket.body}` : ""}\n${ticket.path}`, "info");
+			const source = join(rootDir, ...ticket.path.split("/"));
+			const target = join(dirname(source), ticketFileName({ type: ticket.type, id: ticket.id, title }));
+			if (target !== source && existsSync(target)) {
+				ctx.ui.notify(`Ticket file already exists: ${target.slice(rootDir.length + 1)}`, "warning");
 				return;
 			}
-			if (verb === "rename") {
-				const renameArgs = rest.match(/^#?(\S+)\s+([\s\S]+)$/);
-				const ticket = renameArgs ? findTicket(tree, renameArgs[1]!) : undefined;
-				const title = renameArgs?.[2]?.trim();
-				if (!ticket || !title) {
-					ctx.ui.notify("Usage: /ticket rename <id> <title>", "warning");
-					return;
-				}
-				const source = join(rootDir, ...ticket.path.split("/"));
-				const target = join(dirname(source), ticketFileName({ type: ticket.type, id: ticket.id, title }));
-				if (target !== source && existsSync(target)) {
-					ctx.ui.notify(`Ticket file already exists: ${target.slice(rootDir.length + 1)}`, "warning");
-					return;
-				}
-				await writeFile(source, rewriteTicketTitle(readFileSync(source, "utf8"), title), "utf8");
-				if (target !== source) await rename(source, target);
-				ctx.ui.notify(`Renamed ${ticket.id}: ${ticket.title} -> ${title}`, "info");
+			await writeFile(source, rewriteTicketTitle(readFileSync(source, "utf8"), title), "utf8");
+			if (target !== source) await rename(source, target);
+			ctx.ui.notify(`Renamed ${ticket.id}: ${ticket.title} -> ${title}`, "info");
+		},
+	});
+
+	pi.registerCommand("ticket-status", {
+		description: "Set a ticket status: /ticket-status <id> todo|started|done",
+		handler: async (args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const statusArgs = args.trim().match(/^#?(\S+)\s+(todo|started|done)$/i);
+			const ticket = statusArgs ? findTicket(readTracksTree(rootDir), statusArgs[1]!) : undefined;
+			const status = statusArgs?.[2]?.toLowerCase() as TicketStatus | undefined;
+			if (!ticket || !status) {
+				ctx.ui.notify("Usage: /ticket-status <id> todo|started|done", "warning");
 				return;
 			}
-			if (verb === "status") {
-				const statusArgs = rest.match(/^#?(\S+)\s+(todo|started|done)$/i);
-				const ticket = statusArgs ? findTicket(tree, statusArgs[1]!) : undefined;
-				const status = statusArgs?.[2]?.toLowerCase() as TicketStatus | undefined;
-				if (!ticket || !status) {
-					ctx.ui.notify("Usage: /ticket status <id> todo|started|done", "warning");
-					return;
-				}
-				const path = join(rootDir, ...ticket.path.split("/"));
-				await writeFile(path, rewriteTicketStatus(readFileSync(path, "utf8"), status), "utf8");
-				if (status === "done" && ticket.path.split("/")[0] !== ARCHIVE_DIR) {
-					const archived = await archiveTicket(rootDir, ticket);
-					ctx.ui.notify(`Ticket ${ticket.id} -> done, archived to ${archived.slice(rootDir.length + 1)}`, "info");
-					return;
-				}
-				ctx.ui.notify(`Ticket ${ticket.id} -> ${status}`, "info");
+			const path = join(rootDir, ...ticket.path.split("/"));
+			await writeFile(path, rewriteTicketStatus(readFileSync(path, "utf8"), status), "utf8");
+			ctx.ui.notify(`Ticket ${ticket.id} -> ${status}`, "info");
+		},
+	});
+
+	pi.registerCommand("ticket-clear", {
+		description: "Permanently delete every done ticket in the live .pi/tracks/ tree",
+		handler: async (_args, ctx) => {
+			const rootDir = await ensureTracks(ctx.cwd);
+			const done = doneTickets(readTracksTree(rootDir)).filter((ticket) => ticket.path.split("/")[0] !== ARCHIVE_DIR);
+			if (!done.length) {
+				ctx.ui.notify("No done tickets to clear", "warning");
 				return;
 			}
-			const archived = rest && filterTickets(tree, { idPrefix: rest.replace(/^#/, "") }).find((ticket) => ticket.path.split("/")[0] === ARCHIVE_DIR);
-			if (!archived) {
-				ctx.ui.notify(`No archived ticket: ${rest || "<id>"}`, "warning");
-				return;
-			}
-			const target = await restoreTicket(rootDir, archived);
-			ctx.ui.notify(`Restored ${archived.id} -> ${target.slice(rootDir.length + 1)}`, "info");
+			for (const ticket of done) await rm(join(rootDir, ...ticket.path.split("/")), { force: true });
+			ctx.ui.notify(`Cleared ${done.length} done ticket${done.length === 1 ? "" : "s"}`, "info");
 		},
 	});
 

@@ -1,13 +1,13 @@
 // Pure lean-flow helpers: plan/run parsing plus tracks-tree and ticket file IO. Entry points are
 // plan/run (tasksFromPlanText, branchSlug, reviewVerdict) and tracks/tickets (parseTracks,
-// parseTicketFile, readTracksTree, parseTicketFilters, filterTickets, archive/restore/migrate ticket). No Pi imports so
-// tests/*.test.ts run under plain `node --test`. Split trigger: move ticket read/write/archive/migrate
+// parseTicketFile, readTracksTree, parseTicketFilters, filterTickets, import tickets). No Pi imports so
+// tests/*.test.ts run under plain `node --test`. Split trigger: move ticket read/write/migrate
 // into lean-flow-tickets.ts once ticket IO outgrows parsing.
 
 import { randomBytes } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 export type LeanAgent = "worker" | "reviewer" | "researcher";
 
@@ -434,47 +434,36 @@ export function ticketCounts(tree: TrackNode): Record<string, number> {
 	return counts;
 }
 
+// A track is completed when its own tickets and every nested track are done; empty folders count.
+function trackCompleted(node: TrackNode): boolean {
+	return node.issues.every((ticket) => ticket.status === "done") && node.children.every(trackCompleted);
+}
+
+// Every completed track node, parents before their nested tracks (root excluded). `/track-clear` acts on these.
+export function completedTracks(tree: TrackNode): TrackNode[] {
+	const tracks: TrackNode[] = [];
+	const visit = (node: TrackNode) => {
+		for (const child of node.children) {
+			if (trackCompleted(child)) tracks.push(child);
+			visit(child);
+		}
+	};
+	visit(tree);
+	return tracks;
+}
+
+// Done tickets at any depth in track order. `/ticket-clear` acts on these.
+export function doneTickets(tree: TrackNode): Ticket[] {
+	const tickets: Ticket[] = [];
+	walkTickets(tree, (ticket) => {
+		if (ticket.status === "done") tickets.push(ticket);
+	});
+	return tickets;
+}
+
 // Top-level `archive` is reserved: done tickets mirror their track under archive/<YYYY-MM>/.
 export const ARCHIVE_DIR = "archive";
 export const INBOX_DIR = "inbox";
-
-function archiveDir(root: string): string {
-	return join(root, ARCHIVE_DIR);
-}
-
-function pathSegments(path: string): string[] {
-	return path.split(/[/\\]/).filter((segment) => segment && segment !== "." && segment !== "..");
-}
-
-function archiveMonth(date: Date | string): string {
-	const iso = typeof date === "string" ? date : date.toISOString();
-	return iso.match(/^(\d{4})-(\d{2})/)?.[0] ?? iso.slice(0, 7);
-}
-
-// Archive path mirrors the ticket's track under archive/<YYYY-MM>/; root tickets sit directly there.
-export function archiveTicketPath(root: string, ticket: Pick<Ticket, "track" | "path">, date: Date | string = new Date()): string {
-	return join(archiveDir(root), archiveMonth(date), ...pathSegments(ticket.track), baseName(ticket.path));
-}
-
-// Move a ticket under its mirrored archive path.
-export async function archiveTicket(root: string, ticket: Pick<Ticket, "track" | "path">, date: Date | string = new Date()): Promise<string> {
-	const source = join(root, ...pathSegments(ticket.path));
-	const target = archiveTicketPath(root, ticket, date);
-	await mkdir(dirname(target), { recursive: true });
-	await rename(source, target);
-	return target;
-}
-
-// Move an archived ticket back under its original track, recreating missing folders.
-export async function restoreTicket(root: string, ticket: Pick<Ticket, "path" | "track">): Promise<string> {
-	const source = join(root, ...pathSegments(ticket.path));
-	const segments = pathSegments(ticket.path);
-	const original = segments[0] === ARCHIVE_DIR && /^\d{4}-\d{2}$/.test(segments[1] ?? "") ? segments.slice(2) : segments;
-	const target = join(root, ...original);
-	await mkdir(dirname(target), { recursive: true });
-	await rename(source, target);
-	return target;
-}
 
 // Rename legacy `<slug>.md` tickets in place, minting a 6-hex id and keeping the track folder.
 async function renameLegacyTickets(dir: string, used: Set<string>): Promise<boolean> {

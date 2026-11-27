@@ -8,9 +8,9 @@ import test from "node:test";
 
 import {
 	appendPlanStep,
-	archiveTicket,
-	archiveTicketPath,
 	branchSlug,
+	completedTracks,
+	doneTickets,
 	filterTickets,
 	INBOX_DIR,
 	migrateTracksMd,
@@ -25,7 +25,6 @@ import {
 	planStepsFromText,
 	planTrack,
 	readTracksTree,
-	restoreTicket,
 	reviewVerdict,
 	rewriteTicketStatus,
 	serializeTicketFile,
@@ -423,27 +422,74 @@ test("filterTickets combines track prefixes with type, status, and id prefixes",
 	assert.equal(ticketIndexLines(all, 0), "…4 more");
 });
 
-test("archive helpers mirror the track and restore recreates folders", async () => {
-	const root = mkdtempSync(join(tmpdir(), "lean-archive-"));
-	try {
-		const ticket = { track: "area/sub", path: "area/sub/bug-a1b2c3-fix-route.md" };
-		const archived = archiveTicketPath(root, ticket, new Date("2026-11-05T00:00:00Z"));
-		assert.equal(archived, join(root, "archive", "2026-11", "area", "sub", "bug-a1b2c3-fix-route.md"));
-		assert.equal(archiveTicketPath(root, { track: "", path: "rnd-abc123-solo.md" }, "2026-11-05T00:00:00Z"), join(root, "archive", "2026-11", "rnd-abc123-solo.md"));
+test("completedTracks selects all-done and empty tracks, skipping a parent with one started child", () => {
+	const done = (path: string) => parseTicketFile("---\nstatus: done\n---\n\n# Done\n", path, path.split("/").slice(0, -1).join("/"));
+	const allDone = {
+		name: "",
+		path: "",
+		issues: [],
+		children: [{
+			name: "area",
+			path: "area",
+			issues: [done("area/feature-aaa111-a.md")],
+			children: [{ name: "nested", path: "area/nested", issues: [done("area/nested/bug-bbb222-b.md")], children: [] }],
+		}],
+	};
+	assert.deepEqual(completedTracks(allDone).map((track) => track.path), ["area", "area/nested"]);
 
-		mkdirSync(join(root, "area", "sub"), { recursive: true });
-		writeFileSync(join(root, ...ticket.path.split("/")), "ticket");
-		assert.equal(await archiveTicket(root, ticket, new Date("2026-11-05T00:00:00Z")), archived);
-		assert.equal(existsSync(join(root, ...ticket.path.split("/"))), false);
-		assert.equal(readFileSync(archived, "utf8"), "ticket");
+	const empty = {
+		name: "",
+		path: "",
+		issues: [],
+		children: [{ name: "empty", path: "empty", issues: [], children: [{ name: "nested-empty", path: "empty/nested-empty", issues: [], children: [] }] }],
+	};
+	assert.deepEqual(completedTracks(empty).map((track) => track.path), ["empty", "empty/nested-empty"]);
 
-		const archivedTicket = { track: "archive/2026-11/area/sub", path: "archive/2026-11/area/sub/bug-a1b2c3-fix-route.md" };
-		const restored = await restoreTicket(root, archivedTicket);
-		assert.equal(restored, join(root, "area", "sub", "bug-a1b2c3-fix-route.md"));
-		assert.equal(readFileSync(restored, "utf8"), "ticket");
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
+	const startedChild = {
+		name: "",
+		path: "",
+		issues: [],
+		children: [{
+			name: "pending",
+			path: "pending",
+			issues: [done("pending/feature-ccc333-c.md")],
+			children: [{ name: "child", path: "pending/child", issues: [parseTicketFile("---\nstatus: started\n---\n\n# Started\n", "pending/child/bug-ddd444-d.md")], children: [] }],
+		}],
+	};
+	assert.deepEqual(completedTracks(startedChild).map((track) => track.path), []);
+});
+
+test("doneTickets selects plain and nested done tickets and none when every ticket is open", () => {
+	const ticket = (path: string, status: "todo" | "started" | "done") => parseTicketFile(`---\nstatus: ${status}\n---\n\n# Ticket\n`, path, path.split("/").slice(0, -1).join("/"));
+	const tree = {
+		name: "",
+		path: "",
+		issues: [ticket("bug-aaa111-root-done.md", "done"), ticket("feature-bbb222-root-open.md", "todo")],
+		children: [{
+			name: "area",
+			path: "area",
+			issues: [ticket("area/rnd-ccc333-area-done.md", "done")],
+			children: [{
+				name: "sub",
+				path: "area/sub",
+				issues: [ticket("area/sub/feature-ddd444-sub-done.md", "done"), ticket("area/sub/bug-eee555-sub-started.md", "started")],
+				children: [],
+			}],
+		}],
+	};
+	assert.deepEqual(doneTickets(tree).map((item) => item.path), [
+		"bug-aaa111-root-done.md",
+		"area/rnd-ccc333-area-done.md",
+		"area/sub/feature-ddd444-sub-done.md",
+	]);
+
+	const open = {
+		name: "",
+		path: "",
+		issues: [ticket("feature-fff666-open.md", "todo")],
+		children: [{ name: "busy", path: "busy", issues: [ticket("busy/bug-111aaa-started.md", "started")], children: [] }],
+	};
+	assert.deepEqual(doneTickets(open), []);
 });
 
 test("readTracksTree keeps empty folders as tracks", () => {
