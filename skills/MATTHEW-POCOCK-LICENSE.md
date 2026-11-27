@@ -1,6 +1,6 @@
 # Matt Pocock Skills Attribution
 
-The `project-map`, `prototype`, and `teach` skills are adapted from Matt Pocock's Skills repository:
+The `prototype` and `teach` skills are adapted from Matt Pocock's Skills repository:
 https://github.com/mattpocock/skills
 
 Original license: MIT. Copyright (c) 2026 Matt Pocock.

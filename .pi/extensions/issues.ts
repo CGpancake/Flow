@@ -1,15 +1,11 @@
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { mkdir, readFile, writeFile, rm, readdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
-import { MAPS_DIR } from "./map-tracker.ts";
+import { mkdir, readFile, writeFile, rename, rm, readdir, rmdir } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 // Tiny project-local issue ledger.
 // Entry points: /issue, record_issue, prompt issue expansion.
-// Stores one file per issue under <maps>/notes, falling back to cwd/issues. Uses
-// a notes subfolder (not MAPS_DIR/issues) so this ad-hoc ledger never collides
-// with map-tracker.ts's own per-effort tickets under <maps>/<effort>/issues.
+// Stores one JSON file per issue under cwd/.pi/issues; migrates cwd/issues and light-flow stores on load.
 
 type Issue = {
 	id: number;
@@ -27,19 +23,8 @@ type Store = { nextId: number; issues: Issue[] };
 
 const EMPTY: Store = { nextId: 1, issues: [] };
 
-function projectRoot(cwd: string): string {
-	let current = resolve(cwd);
-	while (true) {
-		if (existsSync(join(current, ".git")) || existsSync(join(current, MAPS_DIR))) return current;
-		const parent = dirname(current);
-		if (parent === current) return resolve(cwd);
-		current = parent;
-	}
-}
-
 function issuesDir(cwd: string): string {
-	const root = projectRoot(cwd);
-	return existsSync(join(root, MAPS_DIR)) ? join(root, MAPS_DIR, "notes") : join(cwd, "issues");
+	return join(cwd, ".pi", "issues");
 }
 
 function slug(text: string): string {
@@ -54,7 +39,56 @@ function legacyStorePaths(cwd: string): string[] {
 	return [join(cwd, "light-flow", "issues.json"), join(cwd, ".pi", "light-flow", "issues.json")];
 }
 
+function legacyIssues(raw: unknown): Issue[] | undefined {
+	if (Array.isArray(raw)) return raw as Issue[];
+	const issues = (raw as { issues?: unknown } | null)?.issues;
+	return Array.isArray(issues) ? (issues as Issue[]) : undefined;
+}
+
+async function removeIfEmpty(dir: string): Promise<void> {
+	try {
+		await rmdir(dir);
+	} catch {}
+}
+
+// ponytail: one-shot, idempotent migration; runs until the old paths are gone.
+async function migrate(cwd: string): Promise<void> {
+	const dir = issuesDir(cwd);
+	const oldDir = join(cwd, "issues");
+	await mkdir(dir, { recursive: true });
+
+	try {
+		for (const name of await readdir(oldDir)) {
+			if (name.endsWith(".json")) await rename(join(oldDir, name), join(dir, name));
+		}
+	} catch (err: any) {
+		if (err?.code !== "ENOENT") throw err;
+	}
+	await removeIfEmpty(oldDir);
+
+	for (const path of legacyStorePaths(cwd)) {
+		let issues: Issue[] | undefined;
+		try {
+			issues = legacyIssues(JSON.parse(await readFile(path, "utf8")));
+		} catch (err: any) {
+			if (err?.code === "ENOENT") continue;
+			throw err;
+		}
+		if (!issues) continue; // unknown shape: leave it for the owner instead of deleting data
+		for (const issue of issues) {
+			try {
+				await writeFile(issuePath(cwd, issue), `${JSON.stringify(issue, null, "\t")}\n`, { encoding: "utf8", flag: "wx" });
+			} catch (err: any) {
+				if (err?.code !== "EEXIST") throw err;
+			}
+		}
+		await rm(path, { force: true });
+		await removeIfEmpty(dirname(path));
+	}
+}
+
 async function load(cwd: string): Promise<Store> {
+	await migrate(cwd);
 	try {
 		const names = await readdir(issuesDir(cwd));
 		const issues: Issue[] = [];
@@ -82,7 +116,6 @@ async function save(cwd: string, store: Store): Promise<void> {
 		const path = join(dir, name);
 		if (name.endsWith(".json") && !keep.has(path)) await rm(path, { force: true });
 	}
-	for (const path of legacyStorePaths(cwd)) await rm(path, { force: true });
 }
 
 function title(issue: Issue): string {
@@ -227,7 +260,7 @@ export default function lightFlowIssues(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("issue", {
-		description: "Project issue files in <maps>/notes (or cwd/issues without a maps dir): /issue <module> <problem>; context | /issue list | /issue clear <ids|all|module|text> | /issue <id> <more context>",
+		description: "Project issue files in cwd/.pi/issues: /issue <module> <problem>; context | /issue list | /issue clear <ids|all|module|text> | /issue <id> <more context>",
 		handler: async (rawArgs, ctx) => {
 			const args = rawArgs.trim();
 			const store = await load(ctx.cwd);
@@ -293,7 +326,7 @@ export default function lightFlowIssues(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "record_issue",
 		label: "Record Issue",
-		description: "Record a project-local open issue in <maps>/notes (or cwd/issues without a maps dir) for later planning/work. Include enough context for a fresh planning agent to act without this chat.",
+		description: "Record a project-local open issue in cwd/.pi/issues for later planning/work. Include enough context for a fresh planning agent to act without this chat.",
 		promptSnippet: "Record a project-local issue with module, concise problem, detailed context, concrete evidence, validation, scope, and done_when when available.",
 		promptGuidelines: [
 			"Use record_issue only when the user asks to defer a discovered problem or when fixing it now would expand scope.",

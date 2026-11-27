@@ -1,7 +1,7 @@
 {
   "name": "lean-flow",
   "version": "1.0.0",
-  "description": "Lean pi workflow extension: grill, plan, work/review subagents, handover, issues, and project maps.",
+  "description": "Lean pi workflow extension: grill, plan, work/review subagents, handover, and issues.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -9,7 +9,7 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node --test tests/*.test.ts"
+    "test": "node --test tests/*.test.ts && node .pi/extensions/lean-flow.test.mjs"
   },
   "pi": {
     "extensions": [

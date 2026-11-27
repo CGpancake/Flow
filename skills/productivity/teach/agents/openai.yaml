@@ -1,5 +1,5 @@
 interface:
   display_name: "Teach"
-  short_description: "Learn a concept in a guided workspace"
+  short_description: "Learn a repo, Rust code, Houdini/VEX terms"
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true
