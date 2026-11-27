@@ -782,7 +782,7 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 				// Live status lives on its own branch line so rail columns never shift as text arrives.
 				if (status === "running" && row.task?.latest) {
 					const prefix = i === rows.length - 1 ? "   " : "│  ";
-					lines.push(...liveTaskLines(row.task.latest, prefix, titleWidth).map((line) => theme.fg("warning", line)));
+					lines.push(theme.fg("warning", liveTaskLine(row.task.latest, prefix, titleWidth)));
 				}
 			});
 			return lines.map((line) => truncateToWidth(line, width));
@@ -792,14 +792,24 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 
 // Live task text uses the whole label column up to the status rail and re-emits its divider,
 // so the running row shows more of the child's line and clips at the rail, not mid-widget.
-const LIVE_LINE_CAP = 10;
-function liveTaskLines(latest: string, prefix: string, labelWidth: number): string[] {
-	// "↳ " or "  " gutter is 2 columns; the rest of the label column is live text.
+// Returns one line only: the widgets add a single live row per running task.
+function liveTaskLine(latest: string, prefix: string, labelWidth: number): string {
+	// "↳ " gutter is 2 columns; the rest of the label column is live text.
 	const room = Math.max(8, labelWidth - 2);
-	const all = wrapTextWithAnsi(latest.trim(), room);
-	const chunks = all.slice(0, LIVE_LINE_CAP);
-	if (all.length > chunks.length) chunks[chunks.length - 1] = truncateToWidth(`${chunks[chunks.length - 1]}…`, room, "…");
-	return chunks.map((chunk, i) => `${prefix}${padRightVisible(`${i === 0 ? "↳ " : "  "}${chunk}`, labelWidth)} │`);
+	const clean = latest.replace(/\s+/g, " ").trim();
+	let text = clean;
+	if (visibleWidth(clean) > room) {
+		// Keep the newest words that fit, then mark the dropped history with a leading ellipsis.
+		const words = clean.split(" ");
+		text = "";
+		for (let i = words.length - 1; i >= 0; i--) {
+			const next = text ? `${words[i]} ${text}` : words[i]!;
+			if (visibleWidth(next) > room - 1) break;
+			text = next;
+		}
+		text = text ? `…${text}` : truncateToWidth(clean, room, "…", true);
+	}
+	return `${prefix}${padRightVisible(`↳ ${text}`, labelWidth)} │`;
 }
 
 function planChainSignature(details: LeanChainDetails): string {
@@ -853,7 +863,7 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 				}
 				lines.push(prefix + theme.fg(color, left) + theme.fg(color, statusRail(task, status === "running" ? runningCtxIcon : "/")));
 				// Live task output, on its own branch line so rail columns never shift.
-				if (status === "running" && task.latest) lines.push(...liveTaskLines(task.latest, last ? "   " : "│  ", titleWidth).map((line) => theme.fg("warning", line)));
+				if (status === "running" && task.latest) lines.push(theme.fg("warning", liveTaskLine(task.latest, last ? "   " : "│  ", titleWidth)));
 			});
 			if (d.note) lines.push(theme.fg("muted", d.note));
 			if (options.expanded) {
