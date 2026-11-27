@@ -780,11 +780,12 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 				const color = status === "running" ? "warning" : status === "done" ? "text" : status === "failed" || status === "cancelled" || status === "interrupted" ? "error" : "dim";
 				const branch = i === rows.length - 1 ? "└─" : "├─";
 				const label = padRightVisible(truncateToWidth(`${icons[i]} ${row.label}`, titleWidth, "…", true), titleWidth);
+				const rail = right(row);
 				lines.push(theme.fg(color, branch) + " " + theme.fg(color, label) + theme.fg(color, right(row)));
 				// Live status lives on its own branch line so rail columns never shift as text arrives.
 				if (status === "running" && row.task?.latest) {
 					const prefix = i === rows.length - 1 ? "   " : "│  ";
-					lines.push(theme.fg("warning", liveTaskLine(row.task.latest, prefix, titleWidth)));
+					lines.push(theme.fg("warning", liveTaskLine(row.task.latest, prefix, titleWidth, visibleWidth(rail), AGENT_TAG[row.task.agent] ?? "")));
 				}
 			});
 			return lines.map((line) => truncateToWidth(line, width));
@@ -792,12 +793,13 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 	};
 }
 
-// Live task text uses the whole label column up to the status rail and re-emits its divider,
-// so the running row shows more of the child's line and clips at the rail, not mid-widget.
+// Live task text runs across the label column and the row's own status rail, stopping at the
+// divider before the role glyph so its trailing ` │` lines up with that row's last divider.
 // Returns one line only: the widgets add a single live row per running task.
-function liveTaskLine(latest: string, prefix: string, labelWidth: number): string {
-	// "↳ " gutter is 2 columns; the rest of the label column is live text.
-	const room = Math.max(8, labelWidth - 2);
+function liveTaskLine(latest: string, prefix: string, labelWidth: number, railWidth: number, glyph: string): string {
+	// Drop the rail's trailing space+glyph, then pad to the row's divider: "↳ " costs 2 columns.
+	const fillWidth = labelWidth + railWidth - 3 - visibleWidth(glyph);
+	const room = Math.max(8, fillWidth - 2);
 	const clean = latest.replace(/\s+/g, " ").trim();
 	let text = clean;
 	if (visibleWidth(clean) > room) {
@@ -811,7 +813,7 @@ function liveTaskLine(latest: string, prefix: string, labelWidth: number): strin
 		}
 		text = text ? `…${text}` : `…${tailVisible(clean, room - 1)}`;
 	}
-	return `${prefix}${padRightVisible(`↳ ${text}`, labelWidth)} │`;
+	return `${prefix}${padRightVisible(`↳ ${text}`, fillWidth)} │`;
 }
 
 // Keeps the newest visible columns behind a leading ellipsis, cutting at grapheme boundaries so wide glyphs stay whole.
@@ -874,13 +876,14 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 				const left = padRightVisible(truncateToWidth(titles[i]!, titleWidth, "…", true), titleWidth);
 				const last = i === d.tasks.length - 1;
 				const prefix = theme.fg(color, last ? "└─ " : "├─ ");
+				const rail = status === "queued" ? queuedRail(task) : statusRail(task, status === "running" ? runningCtxIcon : "/");
 				if (status === "queued") {
-					lines.push(prefix + theme.fg("dim", left + queuedRail(task)));
+					lines.push(prefix + theme.fg("dim", left + rail));
 					return;
 				}
-				lines.push(prefix + theme.fg(color, left) + theme.fg(color, statusRail(task, status === "running" ? runningCtxIcon : "/")));
+				lines.push(prefix + theme.fg(color, left) + theme.fg(color, rail));
 				// Live task output, on its own branch line so rail columns never shift.
-				if (status === "running" && task.latest) lines.push(theme.fg("warning", liveTaskLine(task.latest, last ? "   " : "│  ", titleWidth)));
+				if (status === "running" && task.latest) lines.push(theme.fg("warning", liveTaskLine(task.latest, last ? "   " : "│  ", titleWidth, visibleWidth(rail), AGENT_TAG[task.agent] ?? "")));
 			});
 			if (d.note) lines.push(theme.fg("muted", d.note));
 			if (options.expanded) {
