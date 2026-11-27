@@ -93,7 +93,7 @@ has('visibleWidth(queuedRail(task))', "queued chain rows use the rail divider in
 assert.ok(!source.includes("AGENT_MARKS") && !/[\u2692\u2315\u2697]/.test(source), "per-agent emoji marks stay deleted; rows use status ticks");
 has('statusRail(row.task, status === "running" ? runningCtxIcon : "/")', "plan widget animates the running ctx separator");
 has('lines.push(theme.fg(color, branch) + " " + theme.fg(color, label) + theme.fg(color, right(row)));', "plan widget paints the branch glyph with the row color");
-has("liveTaskLines(row.task.latest, prefix, titleWidth)", "running status renders on its own labelled branch lines");
+has("liveTaskLines(row.task.latest, prefix, liveWidth)", "running status renders on its own labelled branch lines");
 has("const LIVE_LINE_CAP = 10;", "live output uses the full label column instead of three narrow lines");
 has("const room = Math.max(8, labelWidth - 2);", "live output wraps at the label column width so it clips at the status rail");
 has('return chunks.map((chunk, i) => `${prefix}${padRightVisible(`${i === 0 ? "↳ " : "  "}${chunk}`, labelWidth)} │`);', "live lines pad to the label width and re-emit the status rail divider");
@@ -135,7 +135,7 @@ has("`${done > 0 ? \"●\" : \"○\"} Plan ${done}/${d.tasks.length}`", "the liv
 has('last ? "└─ " : "├─ "', "chain rows keep the branch tree");
 has('const prefix = theme.fg(color, last ? "└─ " : "├─ ");', "chain widget paints the branch glyph with the row color");
 assert.ok(!source.includes('theme.fg("dim", branch)') && !source.includes('theme.fg("dim", last ? "└─ " : "├─ ")'), "branch glyphs no longer use the dim color in either widget");
-has('liveTaskLines(task.latest, last ? "   " : "│  ", titleWidth)', "a running task keeps its wrapped live output line");
+has('liveTaskLines(task.latest, last ? "   " : "│  ", liveWidth)', "a running task keeps its wrapped live output line");
 has('if (status === "running" && row.task?.latest)', "only a running plan row renders its live status line");
 has('pi.registerCommand("work-add"', "/work-add appends a step to the running plan");
 has("pendingWorkAdditions.push(step)", "/work-add queues the new step for the next boundary");

@@ -719,7 +719,9 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 				return statusRail(row.task, status === "running" ? runningCtxIcon : "/");
 			};
 			const rightWidth = Math.max(0, ...rows.map((row) => visibleWidth(right(row))));
-			const titleWidth = Math.min(Math.max(...rows.map((row, i) => visibleWidth(`${icons[i]} ${row.label}`))), Math.max(0, width - rightWidth - 3));
+			// Live text gets the whole column left of the rail, not just the widest label.
+			const liveWidth = Math.max(0, width - rightWidth - 3);
+			const titleWidth = Math.min(Math.max(...rows.map((row, i) => visibleWidth(`${icons[i]} ${row.label}`))), liveWidth);
 			const done = rows.filter((row) => statusOf(row) === "done").length;
 			const lines = [theme.fg("text", `${done > 0 ? "●" : "○"} Plan ${done}/${rows.length}`) + theme.fg("muted", ` · ${goal}`)];
 			rows.forEach((row, i) => {
@@ -731,7 +733,7 @@ function planOverlayComponent(rows: PlanOverlayRow[], goal: string, theme: Exten
 				// Live status lives on its own branch line so rail columns never shift as text arrives.
 				if (status === "running" && row.task?.latest) {
 					const prefix = i === rows.length - 1 ? "   " : "│  ";
-					lines.push(...liveTaskLines(row.task.latest, prefix, titleWidth).map((line) => theme.fg("warning", line)));
+					lines.push(...liveTaskLines(row.task.latest, prefix, liveWidth).map((line) => theme.fg("warning", line)));
 				}
 			});
 			return lines.map((line) => truncateToWidth(line, width));
@@ -783,8 +785,9 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 					? visibleWidth(queuedRail(task))
 					: visibleWidth(statusRail(task, status === "running" ? runningCtxIcon : "/"));
 			}));
-			// `├─ ` prefix costs 3 columns in the shared label column.
-			const titleWidth = Math.min(Math.max(...titles.map(visibleWidth)), Math.max(0, width - activeRightWidth - 3));
+			// `├─ ` prefix costs 3 columns; live text uses the rest of the label column up to the rail.
+			const liveWidth = Math.max(0, width - activeRightWidth - 3);
+			const titleWidth = Math.min(Math.max(...titles.map(visibleWidth)), liveWidth);
 			const done = d.tasks.filter((task, i) => (task.status ?? d.statuses?.[i] ?? "queued") === "done").length;
 			const lines: string[] = d.goal
 				? [theme.fg("text", `${done > 0 ? "●" : "○"} Plan ${done}/${d.tasks.length}`) + theme.fg("muted", ` · ${d.goal}`)]
@@ -801,7 +804,7 @@ function leanChainComponent(d: LeanChainDetails | undefined, options: { expanded
 				}
 				lines.push(prefix + theme.fg(color, left) + theme.fg(color, statusRail(task, status === "running" ? runningCtxIcon : "/")));
 				// Live task output, on its own branch line so rail columns never shift.
-				if (status === "running" && task.latest) lines.push(...liveTaskLines(task.latest, last ? "   " : "│  ", titleWidth).map((line) => theme.fg("warning", line)));
+				if (status === "running" && task.latest) lines.push(...liveTaskLines(task.latest, last ? "   " : "│  ", liveWidth).map((line) => theme.fg("warning", line)));
 			});
 			if (d.note) lines.push(theme.fg("muted", d.note));
 			if (options.expanded) {
