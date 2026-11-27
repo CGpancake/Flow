@@ -471,9 +471,9 @@ test("migrateTracksMd writes folders and issue files with detail", async () => {
   Nested detail.
 `);
 
-		assert.equal(await migrateTracksMd(tracksMd, tracksDir), true);
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 4);
 		assert.ok(existsSync(tracksMd), "tracks.md stays for humans to compare");
-		assert.equal(await migrateTracksMd(tracksMd, tracksDir), false, "second run is a no-op");
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 0, "second run is a no-op");
 
 		const tree = readTracksTree(tracksDir);
 		assert.deepEqual(tree.children.map((child) => child.name), ["area", "widget-api"]);
@@ -495,6 +495,28 @@ test("migrateTracksMd writes folders and issue files with detail", async () => {
 	}
 });
 
+test("migrateTracksMd merges only missing ledger issues into a populated tree", async () => {
+	const root = mkdtempSync(join(tmpdir(), "lean-merge-"));
+	try {
+		const tracksMd = join(root, "tracks.md");
+		const tracksDir = join(root, ".pi", "tracks");
+		mkdirSync(join(tracksDir, "widget-api"), { recursive: true });
+		writeFileSync(join(tracksDir, "widget-api", "feature-aaaaaa-keep-me.md"), "---\nstatus: started\ntype: feature\n---\n\n# Keep me\n\nOld body.\n");
+
+		writeFileSync(tracksMd, `## widget-api\n\n- [ ] Keep me\n- [ ] Add me\n  New detail.\n`);
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 1, "only the missing issue is added");
+		const tickets = filterTickets(readTracksTree(tracksDir), { track: "widget-api" });
+		assert.deepEqual(tickets.map((ticket) => ticket.title).sort(), ["Add me", "Keep me"]);
+		const kept = tickets.find((ticket) => ticket.title === "Keep me")!;
+		assert.deepEqual([kept.id, kept.path, kept.status, kept.body], ["aaaaaa", "widget-api/feature-aaaaaa-keep-me.md", "started", "Old body."]);
+		assert.deepEqual(tickets.find((ticket) => ticket.title === "Add me")!.body, "New detail.");
+		assert.equal(await migrateTracksMd(tracksMd, tracksDir), 0, "second run is a no-op");
+		assert.deepEqual(filterTickets(readTracksTree(tracksDir), { track: "widget-api" }), tickets, "existing ids and bodies are unchanged");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("migrateTracksMd moves root tickets into inbox and filterTickets loses (root)", async () => {
 	const root = mkdtempSync(join(tmpdir(), "lean-inbox-"));
 	try {
@@ -504,7 +526,7 @@ test("migrateTracksMd moves root tickets into inbox and filterTickets loses (roo
 		writeFileSync(join(tracksDir, typed), "---\nstatus: started\ntype: feature\n---\n\n# Root note\n\nBody.\n");
 		writeFileSync(join(tracksDir, "loose-note.md"), "---\nstatus: todo\n---\n\n# Loose note\n");
 
-		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), true);
+		await migrateTracksMd(join(root, "tracks.md"), tracksDir);
 		assert.deepEqual(readdirSync(tracksDir).filter((name) => /\.md$/i.test(name)), []);
 		const inboxNames = readdirSync(join(tracksDir, INBOX_DIR)).sort();
 		assert.equal(inboxNames.length, 2);
@@ -521,7 +543,7 @@ test("migrateTracksMd moves root tickets into inbox and filterTickets loses (roo
 
 		const moved = readFileSync(join(tracksDir, INBOX_DIR, typed), "utf8");
 		assert.equal(serializeTicketFile(parseTicketFile(moved, `${INBOX_DIR}/${typed}`)), moved);
-		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), false, "second run is a no-op");
+		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), 0, "second run is a no-op");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -535,7 +557,7 @@ test("migrateTracksMd renames legacy slug tickets once and keeps typed files", a
 		writeFileSync(join(tracksDir, "area", "old-note.md"), "---\nstatus: started\n---\n\n# Old note\n\nLegacy body.\n");
 		writeFileSync(join(tracksDir, "area", "feature-abcdef-keep.md"), "# Keep\n");
 
-		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), true);
+		await migrateTracksMd(join(root, "tracks.md"), tracksDir);
 		const names = readdirSync(join(tracksDir, "area")).sort();
 		assert.equal(names.length, 2);
 		assert.ok(names.includes("feature-abcdef-keep.md"));
@@ -550,7 +572,7 @@ test("migrateTracksMd renames legacy slug tickets once and keeps typed files", a
 			track: "area",
 			path: `area/${renamed}`,
 		});
-		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), false, "second run is a no-op");
+		assert.equal(await migrateTracksMd(join(root, "tracks.md"), tracksDir), 0, "second run is a no-op");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

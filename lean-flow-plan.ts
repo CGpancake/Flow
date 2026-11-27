@@ -464,28 +464,35 @@ async function moveRootTickets(root: string, used: Set<string>): Promise<boolean
 	return changed;
 }
 
-// One-shot `tracks.md` -> folders + typed ticket files, plus an in-place rename pass for legacy
-// `<slug>.md` tickets and a root -> inbox/ move. Never deletes `tracks.md` (humans compare first).
-export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<boolean> {
-	const used = ticketIds(readTracksTree(tracksDir));
-	let changed = await moveRootTickets(tracksDir, used);
-	changed = (await renameLegacyTickets(tracksDir, used)) || changed;
-	if (!existsSync(tracksMdPath)) return changed;
-	try {
-		if (readdirSync(tracksDir).length) return changed;
-	} catch {}
+// Additive `tracks.md` merge: existing tickets are keyed by track path plus title, so only
+// missing ledger issues are written with minted typed filenames. Returns how many were added,
+// so a repeat run returns 0. Also renames legacy `<slug>.md` tickets and moves root tickets to
+// inbox/. Never deletes `tracks.md` (humans compare first).
+export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<number> {
+	const tree = readTracksTree(tracksDir);
+	const used = ticketIds(tree);
+	await moveRootTickets(tracksDir, used);
+	await renameLegacyTickets(tracksDir, used);
+	if (!existsSync(tracksMdPath)) return 0;
 	const tracks = parseTracks(readFileSync(tracksMdPath, "utf8"));
-	if (!tracks.length) return false;
+	const existing = new Set<string>();
+	walkTickets(readTracksTree(tracksDir), (ticket) => existing.add(`${ticket.track}\0${ticket.title}`));
+	let added = 0;
 	for (const track of tracks) {
 		const segments = track.name.split("/").map((segment) => segment.trim()).filter((segment) => segment && segment !== "." && segment !== "..");
-		const dir = segments.length ? join(tracksDir, ...segments) : tracksDir;
-		await mkdir(dir, { recursive: true });
+		const trackPath = segments.join("/");
 		for (const issue of track.issues) {
+			const key = `${trackPath}\0${issue.text}`;
+			if (existing.has(key)) continue;
 			const ticket = { type: "feature" as const, id: uniqueTicketId(used), title: issue.text, status: MIGRATED_STATUS[issue.status], body: issue.detail };
+			const dir = segments.length ? join(tracksDir, ...segments) : tracksDir;
+			await mkdir(dir, { recursive: true });
 			await writeFile(join(dir, ticketFileName(ticket)), serializeTicketFile(ticket), "utf8");
+			existing.add(key);
+			added += 1;
 		}
 	}
-	return true;
+	return added;
 }
 
 export function tasksFromPlanText(text: string | undefined, args: string, resumeFrom?: string, skipSteps: string[] = []): LeanTask[] {

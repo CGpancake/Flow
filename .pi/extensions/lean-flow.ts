@@ -135,6 +135,8 @@ type LeanChainDetails = {
 	// Plan goal, so the live work widget can render the same `Plan n/m · goal` header
 	// as the plan overlay instead of a bare row list.
 	goal?: string;
+	// Relative run directory so a completed chain can point at its task output files.
+	runDir?: string;
 };
 
 type LeanChainResult = {
@@ -807,9 +809,24 @@ function liveTaskLine(latest: string, prefix: string, labelWidth: number): strin
 			if (visibleWidth(next) > room - 1) break;
 			text = next;
 		}
-		text = text ? `…${text}` : truncateToWidth(clean, room, "…", true);
+		text = text ? `…${text}` : `…${tailVisible(clean, room - 1)}`;
 	}
 	return `${prefix}${padRightVisible(`↳ ${text}`, labelWidth)} │`;
+}
+
+// Keeps the newest visible columns behind a leading ellipsis, cutting at grapheme boundaries so wide glyphs stay whole.
+function tailVisible(text: string, width: number): string {
+	if (visibleWidth(text) <= width) return text;
+	const parts = Array.from(new Intl.Segmenter().segment(text), (part) => part.segment);
+	let start = parts.length;
+	let used = 0;
+	while (start > 0) {
+		const next = visibleWidth(parts[start - 1]!);
+		if (used + next > width) break;
+		start--;
+		used += next;
+	}
+	return parts.slice(start).join("");
 }
 
 function planChainSignature(details: LeanChainDetails): string {
@@ -1057,7 +1074,7 @@ function activeSummary(activeWorkJob: ActiveWorkJob): string {
 
 function sendWorkSummary(pi: ExtensionAPI, status: "complete" | "cancelled" | "failed" | "paused", summary: string, details: LeanChainDetails): void {
 	const nextStep = status === "complete"
-		? "Review the completed chain outputs and recommend the concise next steps. Do not start more work or treat human validation as a chain task."
+		? `Review the completed chain outputs and recommend the concise next steps. Do not start more work or treat human validation as a chain task. Run files: ${details.runDir ?? "/runs"}.`
 		: status === "paused"
 			? "The chain is paused with remaining steps queued. Wait for the human to resume with /work start from the reported step; do not start more work."
 			: "Review the chain outcome and recommend the concise next steps.";
@@ -1440,6 +1457,7 @@ export default function leanFlow(pi: ExtensionAPI) {
 				currentOutput: progress[current]?.output?.slice(-2000),
 				note: planNote,
 				goal: planChainGoal,
+				runDir: join(CONFIG_DIR_NAME, "lean-flow", "runs", runId),
 			};
 		};
 		const plainSummary = () => {

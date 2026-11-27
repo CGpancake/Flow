@@ -96,7 +96,8 @@ has('lines.push(theme.fg(color, branch) + " " + theme.fg(color, label) + theme.f
 has("const liveWidth = Math.max(0, width - rightWidth - 3);", "plan widget live lines use the width left of the status rail");
 has("liveTaskLine(row.task.latest, prefix, titleWidth)", "running status renders on its own labelled branch line");
 assert.ok(!source.includes("LIVE_LINE_CAP"), "live output has no line cap");
-has("truncateToWidth(clean, room, \"…\", true)", "last-resort live output truncates to one line instead of wrapping");
+has("`…${tailVisible(clean, room - 1)}`", "last-resort live output keeps the newest visible columns on one line");
+has('return parts.slice(start).join("");', "tailVisible slices from the string tail so overlong tokens keep their newest characters");
 has("function liveTaskLine(", "live output returns exactly one line so callers cannot add extra live rows");
 has('return `${prefix}${padRightVisible(`↳ ${text}`, labelWidth)} │`;', "the live line pads to the label width and re-emits the status rail divider");
 has("const titleWidth = liveWidth;", "labels pad to the full column so every rail divider aligns");
@@ -161,8 +162,11 @@ has("const tracksMigrated = new Set<string>();", "migration runs at most once pe
 has("if (!tracksMigrated.has(dir)) {", "migration is gated by the one-shot cache");
 has('await migrateTracksMd(join(cwd, CONFIG_DIR_NAME, "tracks.md"), dir);', "/track migrates the legacy tracks.md ledger");
 has("tracksMigrated.add(dir);", "the cache is marked after migration so a later clear cannot re-import");
-has("if (readdirSync(tracksDir).length) return changed;", "migration skips an already-populated tree");
-has("if (!existsSync(tracksMdPath)) return changed;", "migration skips a missing legacy ledger");
+has("export async function migrateTracksMd(tracksMdPath: string, tracksDir: string): Promise<number>", "migration returns how many tickets it added");
+has("const key = `${trackPath}\\0${issue.text}`;", "migration keys existing tickets by track path plus title");
+has("if (existing.has(key)) continue;", "migration writes only missing ledger issues");
+has("added += 1;", "migration counts each added ticket");
+has("if (!existsSync(tracksMdPath)) return 0;", "migration skips a missing legacy ledger");
 has("const rootDir = await ensureTracks(ctx.cwd);", "/track migrates before every subcommand");
 has("if (/^add\\b/i.test(input)) {", "/track add creates a folder");
 has("await mkdir(path, { recursive: true });", "/track add supports nested area/sub paths");
